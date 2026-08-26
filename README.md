@@ -23,23 +23,21 @@ A high-performance, zero-allocation Rust parser and interval-math evaluator for 
 
 ### Installation
 
-#### 1. Via `Cargo.toml`
+#### 1. Via Crates.io (Recommended)
+
+```bash
+cargo add openhours chrono
+```
+
+Or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-openhours = { git = "https://github.com/chneau/openhours-rs" }
+openhours = "1.0.0"
 chrono = "0.4"
 ```
 
-Or pinned to a release tag:
-
-```toml
-[dependencies]
-openhours = { git = "https://github.com/chneau/openhours-rs", tag = "v1.0.0" }
-chrono = "0.4"
-```
-
-#### 2. Via Cargo CLI
+#### 2. Via Git Repository
 
 ```bash
 cargo add --git https://github.com/chneau/openhours-rs
