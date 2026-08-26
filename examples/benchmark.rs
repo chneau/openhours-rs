@@ -13,6 +13,9 @@ fn main() {
     let fixed_time = Utc.with_ymd_and_hms(2026, 5, 18, 10, 0, 0).unwrap();
     let iterations = 10_000;
     let four_hours = Duration::hours(4);
+    // Multiply iteration counts by this factor so benchmarks run longer and
+    // yield more stable per-op timings across all workloads.
+    let bench_scale = 10;
 
     // Warm-up
     let json_str = format!("\"{}\"", complex_expr);
@@ -25,11 +28,11 @@ fn main() {
 
     // 1. IsOpen (100k rolling calls)
     let t0 = Instant::now();
-    for i in 0..(iterations * 10) {
+    for i in 0..(iterations * 10 * bench_scale) {
         oh.is_open(&(start + Duration::minutes(i)));
     }
     let d1 = t0.elapsed();
-    let d1_us = d1.as_secs_f64() * 1_000_000.0 / (iterations * 10) as f64;
+    let d1_us = d1.as_secs_f64() * 1_000_000.0 / (iterations * 10 * bench_scale) as f64;
     println!(
         "1. IsOpen (100k rolling calls):            {:4} ms ({:.3} us/op)",
         d1.as_millis(),
@@ -38,11 +41,11 @@ fn main() {
 
     // 2. IsOpen (1M pure calls)
     let t0 = Instant::now();
-    for _ in 0..1_000_000 {
+    for _ in 0..(1_000_000 * bench_scale) {
         oh.is_open(&fixed_time);
     }
     let d2 = t0.elapsed();
-    let d2_us = d2.as_secs_f64() * 1_000_000.0 / 1_000_000.0;
+    let d2_us = d2.as_secs_f64() * 1_000_000.0 / (1_000_000 * bench_scale) as f64;
     println!(
         "2. IsOpen (1M pure calls):                 {:4} ms ({:.3} us/op)",
         d2.as_millis(),
@@ -51,11 +54,11 @@ fn main() {
 
     // 3. GetTimeToOpen (10k calls)
     let t0 = Instant::now();
-    for i in 0..iterations {
+    for i in 0..(iterations * bench_scale) {
         oh.get_time_to_open(&(start + Duration::hours(i % 168)));
     }
     let d3 = t0.elapsed();
-    let d3_us = d3.as_secs_f64() * 1_000_000.0 / iterations as f64;
+    let d3_us = d3.as_secs_f64() * 1_000_000.0 / (iterations * bench_scale) as f64;
     println!(
         "3. GetTimeToOpen (10k calls):              {:4} ms ({:.3} us/op)",
         d3.as_millis(),
@@ -64,11 +67,11 @@ fn main() {
 
     // 4. GetTimeToOpenForDuration 4h (10k calls)
     let t0 = Instant::now();
-    for i in 0..iterations {
+    for i in 0..(iterations * bench_scale) {
         oh.get_time_to_open_for_duration(&(start + Duration::hours(i % 168)), four_hours);
     }
     let d4 = t0.elapsed();
-    let d4_us = d4.as_secs_f64() * 1_000_000.0 / iterations as f64;
+    let d4_us = d4.as_secs_f64() * 1_000_000.0 / (iterations * bench_scale) as f64;
     println!(
         "4. GetTimeToOpenForDuration 4h (10k calls):{:4} ms ({:.3} us/op)",
         d4.as_millis(),
@@ -77,11 +80,11 @@ fn main() {
 
     // 5. When 4h (10k calls)
     let t0 = Instant::now();
-    for i in 0..iterations {
+    for i in 0..(iterations * bench_scale) {
         oh.when(&(start + Duration::hours(i % 168)), four_hours);
     }
     let d5 = t0.elapsed();
-    let d5_us = d5.as_secs_f64() * 1_000_000.0 / iterations as f64;
+    let d5_us = d5.as_secs_f64() * 1_000_000.0 / (iterations * bench_scale) as f64;
     println!(
         "5. When 4h (10k calls):                    {:4} ms ({:.3} us/op)",
         d5.as_millis(),
@@ -90,11 +93,11 @@ fn main() {
 
     // 6. NextDur (10k calls)
     let t0 = Instant::now();
-    for i in 0..iterations {
+    for i in 0..(iterations * bench_scale) {
         oh.next_dur(&(start + Duration::hours(i % 168)));
     }
     let d6 = t0.elapsed();
-    let d6_us = d6.as_secs_f64() * 1_000_000.0 / iterations as f64;
+    let d6_us = d6.as_secs_f64() * 1_000_000.0 / (iterations * bench_scale) as f64;
     println!(
         "6. NextDur (10k calls):                    {:4} ms ({:.3} us/op)",
         d6.as_millis(),
@@ -103,11 +106,11 @@ fn main() {
 
     // 7. NextDate (10k calls)
     let t0 = Instant::now();
-    for i in 0..iterations {
+    for i in 0..(iterations * bench_scale) {
         oh.next_date(&(start + Duration::hours(i % 168)));
     }
     let d7 = t0.elapsed();
-    let d7_us = d7.as_secs_f64() * 1_000_000.0 / iterations as f64;
+    let d7_us = d7.as_secs_f64() * 1_000_000.0 / (iterations * bench_scale) as f64;
     println!(
         "7. NextDate (10k calls):                   {:4} ms ({:.3} us/op)",
         d7.as_millis(),
@@ -116,11 +119,11 @@ fn main() {
 
     // 8. Parse Cached (1k calls)
     let t0 = Instant::now();
-    for _ in 0..1_000 {
+    for _ in 0..(1_000 * bench_scale) {
         OpenHours::parse(complex_expr);
     }
     let d8 = t0.elapsed();
-    let d8_us = d8.as_secs_f64() * 1_000_000.0 / 1_000.0;
+    let d8_us = d8.as_secs_f64() * 1_000_000.0 / (1_000 * bench_scale) as f64;
     println!(
         "8. Parse Cached (1k calls):                {:4} ms ({:.3} us/op)",
         d8.as_millis(),
@@ -129,11 +132,11 @@ fn main() {
 
     // 9. JSON Deserialize (1k calls)
     let t0 = Instant::now();
-    for _ in 0..1_000 {
+    for _ in 0..(1_000 * bench_scale) {
         let _: OpenHours = serde_json::from_str(&json_str).unwrap();
     }
     let d9 = t0.elapsed();
-    let d9_us = d9.as_secs_f64() * 1_000_000.0 / 1_000.0;
+    let d9_us = d9.as_secs_f64() * 1_000_000.0 / (1_000 * bench_scale) as f64;
     println!(
         "9. JSON Deserialize (1k calls):            {:4} ms ({:.3} us/op)",
         d9.as_millis(),
@@ -142,8 +145,9 @@ fn main() {
 
     // 10. Stress Test (5,000 unique objects)
     let t0 = Instant::now();
-    let mut locations = Vec::with_capacity(5_000);
-    for i in 0..5_000 {
+    let stress_count: usize = 5_000 * bench_scale as usize;
+    let mut locations = Vec::with_capacity(stress_count);
+    for i in 0..stress_count {
         let h_start = 8 + (i % 60) / 60;
         let m_start = i % 60;
         let h_end = 17 + (i % 60) / 60;
@@ -152,7 +156,7 @@ fn main() {
         locations.push(OpenHours::parse(&expr));
     }
     let d10 = t0.elapsed();
-    let d10_ms_obj = d10.as_secs_f64() * 1_000.0 / 5_000.0;
+    let d10_ms_obj = d10.as_secs_f64() * 1_000.0 / stress_count as f64;
     println!(
         "10. Stress Test (5,000 unique objects):    {:4} ms ({:.4} ms/obj)",
         d10.as_millis(),
