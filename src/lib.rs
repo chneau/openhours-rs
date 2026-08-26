@@ -1,4 +1,4 @@
-use chrono::{DateTime, Datelike, Duration, NaiveDateTime, TimeZone, Timelike, Weekday};
+use chrono::{Datelike, DateTime, Duration, NaiveDateTime, Offset, TimeZone, Timelike, Weekday};
 use dashmap::DashMap;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -42,6 +42,7 @@ pub struct TimeWindow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[repr(align(64))]
 pub struct OpenHours {
     raw: String,
     windows: Vec<TimeWindow>,
@@ -69,19 +70,19 @@ impl OpenHours {
     }
 
     /// Returns the raw OSM expression.
-    #[inline]
+    #[inline(always)]
     pub fn raw(&self) -> &str {
         &self.raw
     }
 
     /// Returns the slice of baked disjoint time windows.
-    #[inline]
+    #[inline(always)]
     pub fn windows(&self) -> &[TimeWindow] {
         &self.windows
     }
 
     /// Returns true if the schedule is 24/7.
-    #[inline]
+    #[inline(always)]
     pub fn is_always_open(&self) -> bool {
         self.windows.len() == 1
             && self.windows[0].start == 0
@@ -89,12 +90,12 @@ impl OpenHours {
     }
 
     /// Returns true if the schedule is completely closed / empty.
-    #[inline]
+    #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.windows.is_empty()
     }
 
-    /// $O(1)$ scalar hardware bit testing evaluating in ~0.5 - 1.0 nanoseconds.
+    /// Ultra-fast $O(1)$ scalar hardware bit testing using 64-bit integer timestamp math.
     #[inline(always)]
     pub fn is_open<Tz: TimeZone>(&self, dt: &DateTime<Tz>) -> bool {
         if self.windows.is_empty() {
@@ -104,7 +105,7 @@ impl OpenHours {
             return true;
         }
 
-        let week_min = Self::get_week_minute(dt.weekday(), dt.hour(), dt.minute());
+        let week_min = Self::get_week_minute_tz(dt);
         let word = week_min >> 6;
         let mask = 1u64 << (week_min & 63);
         (self.bitmask[word] & mask) != 0
@@ -120,7 +121,7 @@ impl OpenHours {
             return true;
         }
 
-        let week_min = Self::get_week_minute(dt.weekday(), dt.hour(), dt.minute());
+        let week_min = Self::get_week_minute_naive(dt.weekday(), dt.hour(), dt.minute());
         let word = week_min >> 6;
         let mask = 1u64 << (week_min & 63);
         (self.bitmask[word] & mask) != 0
@@ -141,11 +142,12 @@ impl OpenHours {
             return Some(Duration::zero());
         }
 
-        let week_min = Self::get_week_minute(from.weekday(), from.hour(), from.minute());
+        let week_min = Self::get_week_minute_tz(from);
         let diff_min = self.find_next_open_minute(week_min)?;
 
-        let sub_seconds = from.second() as i64;
-        let sub_nanos = from.nanosecond() as i64;
+        let local_secs = from.timestamp() + from.offset().fix().local_minus_utc() as i64;
+        let sub_seconds = local_secs.rem_euclid(60);
+        let sub_nanos = from.timestamp_subsec_nanos() as i64;
         Some(
             Duration::minutes(diff_min as i64)
                 - Duration::seconds(sub_seconds)
@@ -170,11 +172,12 @@ impl OpenHours {
             return Some(Duration::zero());
         }
 
-        let week_min = Self::get_week_minute(from.weekday(), from.hour(), from.minute());
+        let week_min = Self::get_week_minute_tz(from);
         let diff_min = self.find_next_contiguous_open_minute(week_min, req_minutes)?;
 
-        let sub_seconds = from.second() as i64;
-        let sub_nanos = from.nanosecond() as i64;
+        let local_secs = from.timestamp() + from.offset().fix().local_minus_utc() as i64;
+        let sub_seconds = local_secs.rem_euclid(60);
+        let sub_nanos = from.timestamp_subsec_nanos() as i64;
         Some(
             Duration::minutes(diff_min as i64)
                 - Duration::seconds(sub_seconds)
@@ -183,6 +186,7 @@ impl OpenHours {
     }
 
     /// Returns the exact timestamp when a job of duration `duration` can start.
+    #[inline]
     pub fn when<Tz: TimeZone>(&self, from: &DateTime<Tz>, duration: Duration) -> Option<DateTime<Tz>> {
         let wait = self.get_time_to_open_for_duration(from, duration)?;
         Some(from.clone() + wait)
@@ -200,11 +204,12 @@ impl OpenHours {
             return None;
         }
 
-        let week_min = Self::get_week_minute(dt.weekday(), dt.hour(), dt.minute());
+        let week_min = Self::get_week_minute_tz(dt);
         let diff_min = self.find_current_shift_end_minute(week_min);
 
-        let sub_seconds = dt.second() as i64;
-        let sub_nanos = dt.nanosecond() as i64;
+        let local_secs = dt.timestamp() + dt.offset().fix().local_minus_utc() as i64;
+        let sub_seconds = local_secs.rem_euclid(60);
+        let sub_nanos = dt.timestamp_subsec_nanos() as i64;
         Some(
             dt.clone()
                 + Duration::minutes(diff_min as i64)
@@ -222,7 +227,7 @@ impl OpenHours {
             return (true, Duration::days(365));
         }
 
-        let week_min = Self::get_week_minute(dt.weekday(), dt.hour(), dt.minute());
+        let week_min = Self::get_week_minute_tz(dt);
         let word = week_min >> 6;
         let mask = 1u64 << (week_min & 63);
         let currently_open = (self.bitmask[word] & mask) != 0;
@@ -233,8 +238,9 @@ impl OpenHours {
             self.find_next_open_minute(week_min).unwrap_or(0)
         };
 
-        let sub_seconds = dt.second() as i64;
-        let sub_nanos = dt.nanosecond() as i64;
+        let local_secs = dt.timestamp() + dt.offset().fix().local_minus_utc() as i64;
+        let sub_seconds = local_secs.rem_euclid(60);
+        let sub_nanos = dt.timestamp_subsec_nanos() as i64;
         let dur = Duration::minutes(diff_min as i64)
             - Duration::seconds(sub_seconds)
             - Duration::nanoseconds(sub_nanos);
@@ -242,13 +248,21 @@ impl OpenHours {
     }
 
     /// Returns (is_currently_open, next_transition_timestamp).
+    #[inline]
     pub fn next_date<Tz: TimeZone>(&self, dt: &DateTime<Tz>) -> (bool, DateTime<Tz>) {
         let (is_open, dur) = self.next_dur(dt);
         (is_open, dt.clone() + dur)
     }
 
     #[inline(always)]
-    fn get_week_minute(weekday: Weekday, hour: u32, minute: u32) -> usize {
+    fn get_week_minute_tz<Tz: TimeZone>(dt: &DateTime<Tz>) -> usize {
+        let local_secs = dt.timestamp() + dt.offset().fix().local_minus_utc() as i64;
+        let mins = local_secs.div_euclid(60) + 4320;
+        mins.rem_euclid(MINUTES_PER_WEEK as i64) as usize
+    }
+
+    #[inline(always)]
+    fn get_week_minute_naive(weekday: Weekday, hour: u32, minute: u32) -> usize {
         let day_idx = weekday.num_days_from_monday() as usize; // Monday = 0 .. Sunday = 6
         day_idx * 1440 + (hour as usize) * 60 + (minute as usize)
     }
@@ -346,11 +360,12 @@ impl OpenHours {
     }
 
     fn parse_uncached(expression: &str) -> Self {
-        let mut minutes = vec![false; MINUTES_PER_WEEK];
-        let rules: Vec<&str> = expression.split(';').collect();
+        // Stack-allocated scratchpad for zero heap allocations
+        let mut minutes = [false; MINUTES_PER_WEEK];
+        let rules = expression.split(';');
 
         for rule in rules {
-            let mut r = rule.trim();
+            let r = rule.trim();
             if r.is_empty() {
                 continue;
             }
@@ -363,15 +378,15 @@ impl OpenHours {
                 .replace("OFF", "")
                 .replace("closed", "")
                 .replace("CLOSED", "");
-            r = cleaned.trim();
-            if r.is_empty() {
+            let r_clean = cleaned.trim();
+            if r_clean.is_empty() {
                 continue;
             }
 
             let mut days = Vec::new();
             let mut time_intervals = Vec::new();
 
-            if !Self::parse_rule_tokens(r, &mut days, &mut time_intervals) {
+            if !Self::parse_rule_tokens(r_clean, &mut days, &mut time_intervals) {
                 continue;
             }
 
@@ -391,13 +406,11 @@ impl OpenHours {
                 for &(start, end) in &time_intervals {
                     let start_min = day * 1440 + start;
                     if end > 1440 {
-                        // Overnight shift
                         let actual_end = day * 1440 + end;
                         for m in start_min..actual_end {
                             minutes[m % MINUTES_PER_WEEK] = !is_off;
                         }
                     } else if start > end {
-                        // Inverted overnight shift
                         let actual_end = (day + 1) * 1440 + end;
                         for m in start_min..actual_end {
                             minutes[m % MINUTES_PER_WEEK] = !is_off;
