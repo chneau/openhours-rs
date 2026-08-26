@@ -319,23 +319,28 @@ impl OpenHours {
         start_week_minute: usize,
         req_minutes: usize,
     ) -> Option<usize> {
-        let mut i = 0;
-        while i < MINUTES_PER_WEEK {
-            let candidate = (start_week_minute + i) % MINUTES_PER_WEEK;
-            let mut k = 0;
-            while k < req_minutes {
-                let target = (candidate + k) % MINUTES_PER_WEEK;
-                let word = target >> 6;
-                let mask = 1u64 << (target & 63);
-                if (self.bitmask[word] & mask) == 0 {
+        let mut count = 0;
+        let mut target = start_week_minute;
+
+        while count < MINUTES_PER_WEEK {
+            let word = target >> 6;
+            let mask = 1u64 << (target & 63);
+            if (self.bitmask[word] & mask) == 0 {
+                let wait = self.find_next_open_minute(target)?;
+                count += wait;
+                target = (target + wait) % MINUTES_PER_WEEK;
+                if count >= MINUTES_PER_WEEK {
                     break;
                 }
-                k += 1;
             }
-            if k == req_minutes {
-                return Some(i);
+
+            let shift_len = self.find_current_shift_end_minute(target);
+            if shift_len >= req_minutes {
+                return Some(count);
             }
-            i += k + 1;
+
+            count += shift_len;
+            target = (target + shift_len) % MINUTES_PER_WEEK;
         }
         None
     }

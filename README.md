@@ -86,16 +86,16 @@ fn main() {
 
 | # | Workload | Calls | Latency / Op | Throughput |
 | :--- | :--- | :--- | :--- | :--- |
-| **1** | **`is_open` (Rolling timeline)** | 100,000 | **18.0 ns** | 55,000,000 ops/sec |
+| **1** | **`is_open` (Rolling timeline)** | 100,000 | **16.0 ns** | 62,500,000 ops/sec |
 | **2** | **`is_open` (Pure call)** | 1,000,000 | **< 0.5 ns** | >1,000,000,000 ops/sec |
-| **3** | **`get_time_to_open`** | 10,000 | **59.0 ns** | 17,000,000 ops/sec |
-| **4** | **`get_time_to_open_for_duration` 4h** | 10,000 | **3.3 µs** | 300,000 ops/sec |
-| **5** | **`when` 4h** | 10,000 | **3.0 µs** | 330,000 ops/sec |
-| **6** | **`next_dur`** | 10,000 | **55.0 ns** | 18,000,000 ops/sec |
-| **7** | **`next_date`** | 10,000 | **57.0 ns** | 17,500,000 ops/sec |
-| **8** | **`parse` (Cached)** | 1,000 | **32.0 ns** | 31,000,000 ops/sec |
-| **9** | **`JSON Deserialize`** | 1,000 | **126 ns** | 8,000,000 ops/sec |
-| **10** | **Stress Test (5,000 unique objects)** | 5,000 | **0.3 µs/obj** | 3,300,000 objs/sec |
+| **3** | **`get_time_to_open`** | 10,000 | **76.0 ns** | 13,000,000 ops/sec |
+| **4** | **`get_time_to_open_for_duration` 4h** | 10,000 | **103.0 ns** | 9,700,000 ops/sec |
+| **5** | **`when` 4h** | 10,000 | **99.0 ns** | 10,100,000 ops/sec |
+| **6** | **`next_dur`** | 10,000 | **73.0 ns** | 13,700,000 ops/sec |
+| **7** | **`next_date`** | 10,000 | **86.0 ns** | 11,600,000 ops/sec |
+| **8** | **`parse` (Cached)** | 1,000 | **47.0 ns** | 21,000,000 ops/sec |
+| **9** | **`JSON Deserialize`** | 1,000 | **161 ns** | 6,200,000 ops/sec |
+| **10** | **Stress Test (5,000 unique objects)** | 5,000 | **0.4 µs/obj** | 2,500,000 objs/sec |
 
 ---
 
