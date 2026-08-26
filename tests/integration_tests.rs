@@ -271,3 +271,60 @@ fn test_concurrent_multithreaded_evaluations() {
         h.join().unwrap();
     }
 }
+
+#[test]
+fn test_sub_minute_precision() {
+    let base = monday_midnight();
+    let oh = OpenHours::parse("Mo 08:00-17:00");
+
+    // 30 seconds until open.
+    let near_open = base + Duration::hours(7) + Duration::minutes(59) + Duration::seconds(30);
+    let expected = Duration::seconds(30);
+    let wait = oh.get_time_to_open(&near_open).unwrap();
+    assert_eq!(wait, expected);
+
+    // 30 seconds until close while open.
+    let near_close = base + Duration::hours(16) + Duration::minutes(59) + Duration::seconds(30);
+    let (is_open, dur) = oh.next_dur(&near_close);
+    assert!(is_open);
+    assert_eq!(dur, Duration::seconds(30));
+
+    // next_date truncates back exactly to 17:00.
+    let (is_open_next, next_date) = oh.next_date(&near_close);
+    assert!(is_open_next);
+    assert_eq!(next_date, base + Duration::hours(17));
+}
+
+#[test]
+fn test_advanced_day_syntax() {
+    let base = monday_midnight();
+
+    // Comma day list.
+    let list = OpenHours::parse("Mo, Tu, We 08:00-12:00");
+    assert!(list.is_open(&(base + Duration::hours(10))));
+    assert!(list.is_open(&(base + Duration::hours(24 + 10))));
+    assert!(list.is_open(&(base + Duration::hours(48 + 10))));
+    assert!(!list.is_open(&(base + Duration::hours(72 + 10)))); // Thursday
+
+    // Full-name aliases.
+    let full = OpenHours::parse("Monday-Friday 08:00-17:00");
+    assert!(full.is_open(&(base + Duration::hours(10))));
+    assert!(!full.is_open(&(base + Duration::days(5) + Duration::hours(10))));
+
+    // Combined range + list.
+    let combined = OpenHours::parse("Mo-We, Fr 08:00-17:00");
+    assert!(combined.is_open(&(base + Duration::days(2) + Duration::hours(10)))); // Wed
+    assert!(!combined.is_open(&(base + Duration::days(3) + Duration::hours(10)))); // Thu
+    assert!(combined.is_open(&(base + Duration::days(4) + Duration::hours(10)))); // Fri
+
+    // 00:00-00:00 all-day on the selected day.
+    let midnight = OpenHours::parse("Mo 00:00-00:00");
+    assert!(midnight.is_open(&(base + Duration::hours(15))));
+    assert!(!midnight.is_open(&(base + Duration::days(1) + Duration::hours(15))));
+
+    // Day-only defaults to 24h on those days.
+    let mo = OpenHours::parse("Mo");
+    assert!(mo.is_open(&base));
+    assert!(mo.is_open(&(base + Duration::hours(23) + Duration::minutes(59))));
+    assert!(!mo.is_open(&(base + Duration::hours(24))));
+}
