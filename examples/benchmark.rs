@@ -1,0 +1,162 @@
+use chrono::{Duration, TimeZone, Utc};
+use openhours::OpenHours;
+use std::time::Instant;
+
+fn main() {
+    println!("========================================================");
+    println!("Running OpenHours Benchmarks (Rust Standard Suite)");
+    println!("========================================================");
+
+    let complex_expr = "Mo-Fr 08:00-12:00, 13:00-17:00; Sa 08:00-12:00";
+    let oh = OpenHours::parse(complex_expr);
+    let start = Utc.with_ymd_and_hms(2026, 5, 18, 0, 0, 0).unwrap();
+    let fixed_time = Utc.with_ymd_and_hms(2026, 5, 18, 10, 0, 0).unwrap();
+    let iterations = 10_000;
+    let four_hours = Duration::hours(4);
+
+    // Warm-up
+    let json_str = format!("\"{}\"", complex_expr);
+    for i in 0..10_000 {
+        oh.is_open(&(start + Duration::minutes(i % 168)));
+        oh.get_time_to_open(&(start + Duration::hours(i % 168)));
+        OpenHours::parse(complex_expr);
+        let _: OpenHours = serde_json::from_str(&json_str).unwrap();
+    }
+
+    // 1. IsOpen (100k rolling calls)
+    let t0 = Instant::now();
+    for i in 0..(iterations * 10) {
+        oh.is_open(&(start + Duration::minutes(i)));
+    }
+    let d1 = t0.elapsed();
+    let d1_us = d1.as_secs_f64() * 1_000_000.0 / (iterations * 10) as f64;
+    println!(
+        "1. IsOpen (100k rolling calls):            {:4} ms ({:.3} us/op)",
+        d1.as_millis(),
+        d1_us
+    );
+
+    // 2. IsOpen (1M pure calls)
+    let t0 = Instant::now();
+    for _ in 0..1_000_000 {
+        oh.is_open(&fixed_time);
+    }
+    let d2 = t0.elapsed();
+    let d2_us = d2.as_secs_f64() * 1_000_000.0 / 1_000_000.0;
+    println!(
+        "2. IsOpen (1M pure calls):                 {:4} ms ({:.3} us/op)",
+        d2.as_millis(),
+        d2_us
+    );
+
+    // 3. GetTimeToOpen (10k calls)
+    let t0 = Instant::now();
+    for i in 0..iterations {
+        oh.get_time_to_open(&(start + Duration::hours(i % 168)));
+    }
+    let d3 = t0.elapsed();
+    let d3_us = d3.as_secs_f64() * 1_000_000.0 / iterations as f64;
+    println!(
+        "3. GetTimeToOpen (10k calls):              {:4} ms ({:.3} us/op)",
+        d3.as_millis(),
+        d3_us
+    );
+
+    // 4. GetTimeToOpenForDuration 4h (10k calls)
+    let t0 = Instant::now();
+    for i in 0..iterations {
+        oh.get_time_to_open_for_duration(&(start + Duration::hours(i % 168)), four_hours);
+    }
+    let d4 = t0.elapsed();
+    let d4_us = d4.as_secs_f64() * 1_000_000.0 / iterations as f64;
+    println!(
+        "4. GetTimeToOpenForDuration 4h (10k calls):{:4} ms ({:.3} us/op)",
+        d4.as_millis(),
+        d4_us
+    );
+
+    // 5. When 4h (10k calls)
+    let t0 = Instant::now();
+    for i in 0..iterations {
+        oh.when(&(start + Duration::hours(i % 168)), four_hours);
+    }
+    let d5 = t0.elapsed();
+    let d5_us = d5.as_secs_f64() * 1_000_000.0 / iterations as f64;
+    println!(
+        "5. When 4h (10k calls):                    {:4} ms ({:.3} us/op)",
+        d5.as_millis(),
+        d5_us
+    );
+
+    // 6. NextDur (10k calls)
+    let t0 = Instant::now();
+    for i in 0..iterations {
+        oh.next_dur(&(start + Duration::hours(i % 168)));
+    }
+    let d6 = t0.elapsed();
+    let d6_us = d6.as_secs_f64() * 1_000_000.0 / iterations as f64;
+    println!(
+        "6. NextDur (10k calls):                    {:4} ms ({:.3} us/op)",
+        d6.as_millis(),
+        d6_us
+    );
+
+    // 7. NextDate (10k calls)
+    let t0 = Instant::now();
+    for i in 0..iterations {
+        oh.next_date(&(start + Duration::hours(i % 168)));
+    }
+    let d7 = t0.elapsed();
+    let d7_us = d7.as_secs_f64() * 1_000_000.0 / iterations as f64;
+    println!(
+        "7. NextDate (10k calls):                   {:4} ms ({:.3} us/op)",
+        d7.as_millis(),
+        d7_us
+    );
+
+    // 8. Parse Cached (1k calls)
+    let t0 = Instant::now();
+    for _ in 0..1_000 {
+        OpenHours::parse(complex_expr);
+    }
+    let d8 = t0.elapsed();
+    let d8_us = d8.as_secs_f64() * 1_000_000.0 / 1_000.0;
+    println!(
+        "8. Parse Cached (1k calls):                {:4} ms ({:.3} us/op)",
+        d8.as_millis(),
+        d8_us
+    );
+
+    // 9. JSON Deserialize (1k calls)
+    let t0 = Instant::now();
+    for _ in 0..1_000 {
+        let _: OpenHours = serde_json::from_str(&json_str).unwrap();
+    }
+    let d9 = t0.elapsed();
+    let d9_us = d9.as_secs_f64() * 1_000_000.0 / 1_000.0;
+    println!(
+        "9. JSON Deserialize (1k calls):            {:4} ms ({:.3} us/op)",
+        d9.as_millis(),
+        d9_us
+    );
+
+    // 10. Stress Test (5,000 unique objects)
+    let t0 = Instant::now();
+    let mut locations = Vec::with_capacity(5_000);
+    for i in 0..5_000 {
+        let h_start = 8 + (i % 60) / 60;
+        let m_start = i % 60;
+        let h_end = 17 + (i % 60) / 60;
+        let m_end = i % 60;
+        let expr = format!("Mo-Fr {:02}:{:02}-{:02}:{:02}", h_start, m_start, h_end, m_end);
+        locations.push(OpenHours::parse(&expr));
+    }
+    let d10 = t0.elapsed();
+    let d10_ms_obj = d10.as_secs_f64() * 1_000.0 / 5_000.0;
+    println!(
+        "10. Stress Test (5,000 unique objects):    {:4} ms ({:.4} ms/obj)",
+        d10.as_millis(),
+        d10_ms_obj
+    );
+    println!("========================================================");
+}

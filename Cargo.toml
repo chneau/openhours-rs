@@ -1,0 +1,27 @@
+[package]
+name = "openhours"
+version = "1.0.0"
+edition = "2021"
+authors = ["chneau <charles63500@gmail.com>"]
+description = "High-performance, zero-allocation OpenStreetMap opening_hours parser and evaluator in Rust."
+license = "MIT"
+repository = "https://github.com/chneau/openhours-rs"
+keywords = ["openstreetmap", "opening_hours", "schedule", "time", "evaluator"]
+categories = ["date-and-time", "parser-implementations", "data-structures"]
+readme = "README.md"
+
+[dependencies]
+chrono = { version = "0.4.39", features = ["serde"] }
+serde = { version = "1.0.218", features = ["derive"] }
+serde_json = "1.0.139"
+dashmap = "6.1.0"
+
+[[example]]
+name = "benchmark"
+path = "examples/benchmark.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
