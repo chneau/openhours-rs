@@ -58,7 +58,7 @@ fn main() {
     reset_alloc();
     let t0 = Instant::now();
     for i in 0..(iterations * 10 * bench_scale) {
-        oh.is_open(&(start + Duration::minutes(i)));
+        std::hint::black_box(oh.is_open(std::hint::black_box(&(start + Duration::minutes(i)))));
     }
     let d1 = t0.elapsed();
     let alloc1 = get_alloc() as f64 / (iterations * 10 * bench_scale) as f64;
@@ -74,7 +74,7 @@ fn main() {
     reset_alloc();
     let t0 = Instant::now();
     for _ in 0..(1_000_000 * bench_scale) {
-        oh.is_open(&fixed_time);
+        std::hint::black_box(oh.is_open(std::hint::black_box(&fixed_time)));
     }
     let d2 = t0.elapsed();
     let alloc2 = get_alloc() as f64 / (1_000_000 * bench_scale) as f64;
@@ -90,7 +90,7 @@ fn main() {
     reset_alloc();
     let t0 = Instant::now();
     for i in 0..(iterations * bench_scale) {
-        oh.get_time_to_open(&(start + Duration::hours(i % 168)));
+        std::hint::black_box(oh.get_time_to_open(std::hint::black_box(&(start + Duration::hours(i % 168)))));
     }
     let d3 = t0.elapsed();
     let alloc3 = get_alloc() as f64 / (iterations * bench_scale) as f64;
@@ -106,7 +106,7 @@ fn main() {
     reset_alloc();
     let t0 = Instant::now();
     for i in 0..(iterations * bench_scale) {
-        oh.get_time_to_open_for_duration(&(start + Duration::hours(i % 168)), four_hours);
+        std::hint::black_box(oh.get_time_to_open_for_duration(std::hint::black_box(&(start + Duration::hours(i % 168))), std::hint::black_box(four_hours)));
     }
     let d4 = t0.elapsed();
     let alloc4 = get_alloc() as f64 / (iterations * bench_scale) as f64;
@@ -122,7 +122,7 @@ fn main() {
     reset_alloc();
     let t0 = Instant::now();
     for i in 0..(iterations * bench_scale) {
-        oh.when(&(start + Duration::hours(i % 168)), four_hours);
+        std::hint::black_box(oh.when(std::hint::black_box(&(start + Duration::hours(i % 168))), std::hint::black_box(four_hours)));
     }
     let d5 = t0.elapsed();
     let alloc5 = get_alloc() as f64 / (iterations * bench_scale) as f64;
@@ -138,7 +138,7 @@ fn main() {
     reset_alloc();
     let t0 = Instant::now();
     for i in 0..(iterations * bench_scale) {
-        oh.next_dur(&(start + Duration::hours(i % 168)));
+        std::hint::black_box(oh.next_dur(std::hint::black_box(&(start + Duration::hours(i % 168)))));
     }
     let d6 = t0.elapsed();
     let alloc6 = get_alloc() as f64 / (iterations * bench_scale) as f64;
@@ -154,7 +154,7 @@ fn main() {
     reset_alloc();
     let t0 = Instant::now();
     for i in 0..(iterations * bench_scale) {
-        oh.next_date(&(start + Duration::hours(i % 168)));
+        std::hint::black_box(oh.next_date(std::hint::black_box(&(start + Duration::hours(i % 168)))));
     }
     let d7 = t0.elapsed();
     let alloc7 = get_alloc() as f64 / (iterations * bench_scale) as f64;
@@ -170,7 +170,7 @@ fn main() {
     reset_alloc();
     let t0 = Instant::now();
     for _ in 0..(1_000 * bench_scale) {
-        OpenHours::parse(complex_expr);
+        std::hint::black_box(OpenHours::parse(std::hint::black_box(complex_expr)));
     }
     let d8 = t0.elapsed();
     let alloc8 = get_alloc() as f64 / (1_000 * bench_scale) as f64;
@@ -186,7 +186,8 @@ fn main() {
     reset_alloc();
     let t0 = Instant::now();
     for _ in 0..(1_000 * bench_scale) {
-        let _: OpenHours = serde_json::from_str(&json_str).unwrap();
+        let obj: OpenHours = serde_json::from_str(std::hint::black_box(&json_str)).unwrap();
+        std::hint::black_box(obj);
     }
     let d9 = t0.elapsed();
     let alloc9 = get_alloc() as f64 / (1_000 * bench_scale) as f64;
