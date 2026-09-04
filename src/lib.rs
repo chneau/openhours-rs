@@ -69,6 +69,19 @@ impl OpenHours {
             return Arc::clone(&ALWAYS_OPEN);
         }
 
+        // Fast pointer check matching Go's L1 unsafe.StringData check
+        let ptr_hit = LAST_VAL.with(|v| {
+            if let Some(cached) = v.borrow().as_ref() {
+                if cached.raw.as_ptr() == trimmed.as_ptr() && cached.raw.len() == trimmed.len() {
+                    return Some(Arc::clone(cached));
+                }
+            }
+            None
+        });
+        if let Some(cached) = ptr_hit {
+            return cached;
+        }
+
         let hash = std::hash::BuildHasher::hash_one(&rustc_hash::FxBuildHasher, trimmed);
         let hit = LAST_HASH.with(|h| {
             if h.get() == hash && hash != 0 {
@@ -411,6 +424,22 @@ impl OpenHours {
         let sub_seconds = (local_secs % 60) as i64;
         let sub_nanos = dt.timestamp_subsec_nanos() as i64;
         (week_min, sub_seconds, sub_nanos)
+    }
+
+    #[inline(always)]
+    pub fn is_open_utc(&self, dt: &DateTime<chrono::Utc>) -> bool {
+        if self.windows.is_empty() {
+            return false;
+        }
+        if self.is_always_open() {
+            return true;
+        }
+
+        let local_secs = dt.timestamp() as u64;
+        let week_min = ((local_secs / 60 + 4320) % (MINUTES_PER_WEEK as u64)) as usize;
+        let word = week_min >> 6;
+        let mask = 1u64 << (week_min & 63);
+        unsafe { (*self.bitmask.get_unchecked(word) & mask) != 0 }
     }
 
     #[inline(always)]

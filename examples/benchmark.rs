@@ -54,15 +54,28 @@ fn main() {
         let _: OpenHours = serde_json::from_str(&json_str).unwrap();
     }
 
+    // Precalculate timelines up-front matching Go and C# so that chrono's DateTime addition
+    // is not measured inside the algorithm benchmark loops.
+    let rolling_count = iterations * 10 * bench_scale;
+    let mut rolling_timeline = Vec::with_capacity(rolling_count);
+    for i in 0..rolling_count {
+        rolling_timeline.push(start + Duration::minutes(i as i64));
+    }
+
+    let mut hour_timeline = Vec::with_capacity(168);
+    for i in 0..168 {
+        hour_timeline.push(start + Duration::hours(i as i64));
+    }
+
     // 1. IsOpen (100k rolling calls)
     reset_alloc();
     let t0 = Instant::now();
-    for i in 0..(iterations * 10 * bench_scale) {
-        std::hint::black_box(oh.is_open(std::hint::black_box(&(start + Duration::minutes(i)))));
+    for i in 0..rolling_count {
+        std::hint::black_box(oh.is_open(std::hint::black_box(&rolling_timeline[i])));
     }
     let d1 = t0.elapsed();
-    let alloc1 = get_alloc() as f64 / (iterations * 10 * bench_scale) as f64;
-    let d1_us = d1.as_secs_f64() * 1_000_000.0 / (iterations * 10 * bench_scale) as f64;
+    let alloc1 = get_alloc() as f64 / rolling_count as f64;
+    let d1_us = d1.as_secs_f64() * 1_000_000.0 / rolling_count as f64;
     println!(
         "1. IsOpen (100k rolling calls):            {:4} ms ({:.5} us/op, {:.1} B/op)",
         d1.as_millis(),
@@ -90,7 +103,7 @@ fn main() {
     reset_alloc();
     let t0 = Instant::now();
     for i in 0..(iterations * bench_scale) {
-        std::hint::black_box(oh.get_time_to_open(std::hint::black_box(&(start + Duration::hours(i % 168)))));
+        std::hint::black_box(oh.get_time_to_open(std::hint::black_box(&hour_timeline[i % 168])));
     }
     let d3 = t0.elapsed();
     let alloc3 = get_alloc() as f64 / (iterations * bench_scale) as f64;
@@ -106,7 +119,7 @@ fn main() {
     reset_alloc();
     let t0 = Instant::now();
     for i in 0..(iterations * bench_scale) {
-        std::hint::black_box(oh.get_time_to_open_for_duration(std::hint::black_box(&(start + Duration::hours(i % 168))), std::hint::black_box(four_hours)));
+        std::hint::black_box(oh.get_time_to_open_for_duration(std::hint::black_box(&hour_timeline[i % 168]), std::hint::black_box(four_hours)));
     }
     let d4 = t0.elapsed();
     let alloc4 = get_alloc() as f64 / (iterations * bench_scale) as f64;
@@ -122,7 +135,7 @@ fn main() {
     reset_alloc();
     let t0 = Instant::now();
     for i in 0..(iterations * bench_scale) {
-        std::hint::black_box(oh.when(std::hint::black_box(&(start + Duration::hours(i % 168))), std::hint::black_box(four_hours)));
+        std::hint::black_box(oh.when(std::hint::black_box(&hour_timeline[i % 168]), std::hint::black_box(four_hours)));
     }
     let d5 = t0.elapsed();
     let alloc5 = get_alloc() as f64 / (iterations * bench_scale) as f64;
@@ -138,7 +151,7 @@ fn main() {
     reset_alloc();
     let t0 = Instant::now();
     for i in 0..(iterations * bench_scale) {
-        std::hint::black_box(oh.next_dur(std::hint::black_box(&(start + Duration::hours(i % 168)))));
+        std::hint::black_box(oh.next_dur(std::hint::black_box(&hour_timeline[i % 168])));
     }
     let d6 = t0.elapsed();
     let alloc6 = get_alloc() as f64 / (iterations * bench_scale) as f64;
@@ -154,7 +167,7 @@ fn main() {
     reset_alloc();
     let t0 = Instant::now();
     for i in 0..(iterations * bench_scale) {
-        std::hint::black_box(oh.next_date(std::hint::black_box(&(start + Duration::hours(i % 168)))));
+        std::hint::black_box(oh.next_date(std::hint::black_box(&hour_timeline[i % 168])));
     }
     let d7 = t0.elapsed();
     let alloc7 = get_alloc() as f64 / (iterations * bench_scale) as f64;
