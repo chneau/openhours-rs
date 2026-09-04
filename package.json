@@ -4,6 +4,7 @@
   "scripts": {
     "build": "cargo build --release",
     "test": "cargo test",
-    "bench": "cargo bench"
+    "bench": "cargo bench",
+    "start": "bun test"
   }
 }
