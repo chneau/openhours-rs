@@ -64,7 +64,7 @@ fn main() {
     let alloc1 = get_alloc() as f64 / (iterations * 10 * bench_scale) as f64;
     let d1_us = d1.as_secs_f64() * 1_000_000.0 / (iterations * 10 * bench_scale) as f64;
     println!(
-        "1. IsOpen (100k rolling calls):            {:4} ms ({:.3} us/op, {:.1} B/op)",
+        "1. IsOpen (100k rolling calls):            {:4} ms ({:.5} us/op, {:.1} B/op)",
         d1.as_millis(),
         d1_us,
         alloc1
@@ -80,7 +80,7 @@ fn main() {
     let alloc2 = get_alloc() as f64 / (1_000_000 * bench_scale) as f64;
     let d2_us = d2.as_secs_f64() * 1_000_000.0 / (1_000_000 * bench_scale) as f64;
     println!(
-        "2. IsOpen (1M pure calls):                 {:4} ms ({:.3} us/op, {:.1} B/op)",
+        "2. IsOpen (1M pure calls):                 {:4} ms ({:.5} us/op, {:.1} B/op)",
         d2.as_millis(),
         d2_us,
         alloc2
@@ -96,7 +96,7 @@ fn main() {
     let alloc3 = get_alloc() as f64 / (iterations * bench_scale) as f64;
     let d3_us = d3.as_secs_f64() * 1_000_000.0 / (iterations * bench_scale) as f64;
     println!(
-        "3. GetTimeToOpen (10k calls):              {:4} ms ({:.3} us/op, {:.1} B/op)",
+        "3. GetTimeToOpen (10k calls):              {:4} ms ({:.5} us/op, {:.1} B/op)",
         d3.as_millis(),
         d3_us,
         alloc3
@@ -112,7 +112,7 @@ fn main() {
     let alloc4 = get_alloc() as f64 / (iterations * bench_scale) as f64;
     let d4_us = d4.as_secs_f64() * 1_000_000.0 / (iterations * bench_scale) as f64;
     println!(
-        "4. GetTimeToOpenForDuration 4h (10k calls):{:4} ms ({:.3} us/op, {:.1} B/op)",
+        "4. GetTimeToOpenForDuration 4h (10k calls):{:4} ms ({:.5} us/op, {:.1} B/op)",
         d4.as_millis(),
         d4_us,
         alloc4
@@ -128,7 +128,7 @@ fn main() {
     let alloc5 = get_alloc() as f64 / (iterations * bench_scale) as f64;
     let d5_us = d5.as_secs_f64() * 1_000_000.0 / (iterations * bench_scale) as f64;
     println!(
-        "5. When 4h (10k calls):                    {:4} ms ({:.3} us/op, {:.1} B/op)",
+        "5. When 4h (10k calls):                    {:4} ms ({:.5} us/op, {:.1} B/op)",
         d5.as_millis(),
         d5_us,
         alloc5
@@ -144,7 +144,7 @@ fn main() {
     let alloc6 = get_alloc() as f64 / (iterations * bench_scale) as f64;
     let d6_us = d6.as_secs_f64() * 1_000_000.0 / (iterations * bench_scale) as f64;
     println!(
-        "6. NextDur (10k calls):                    {:4} ms ({:.3} us/op, {:.1} B/op)",
+        "6. NextDur (10k calls):                    {:4} ms ({:.5} us/op, {:.1} B/op)",
         d6.as_millis(),
         d6_us,
         alloc6
@@ -160,7 +160,7 @@ fn main() {
     let alloc7 = get_alloc() as f64 / (iterations * bench_scale) as f64;
     let d7_us = d7.as_secs_f64() * 1_000_000.0 / (iterations * bench_scale) as f64;
     println!(
-        "7. NextDate (10k calls):                   {:4} ms ({:.3} us/op, {:.1} B/op)",
+        "7. NextDate (10k calls):                   {:4} ms ({:.5} us/op, {:.1} B/op)",
         d7.as_millis(),
         d7_us,
         alloc7
@@ -176,7 +176,7 @@ fn main() {
     let alloc8 = get_alloc() as f64 / (1_000 * bench_scale) as f64;
     let d8_us = d8.as_secs_f64() * 1_000_000.0 / (1_000 * bench_scale) as f64;
     println!(
-        "8. Parse Cached (1k calls):                {:4} ms ({:.3} us/op, {:.1} B/op)",
+        "8. Parse Cached (1k calls):                {:4} ms ({:.5} us/op, {:.1} B/op)",
         d8.as_millis(),
         d8_us,
         alloc8
@@ -192,7 +192,7 @@ fn main() {
     let alloc9 = get_alloc() as f64 / (1_000 * bench_scale) as f64;
     let d9_us = d9.as_secs_f64() * 1_000_000.0 / (1_000 * bench_scale) as f64;
     println!(
-        "9. JSON Deserialize (1k calls):            {:4} ms ({:.3} us/op, {:.1} B/op)",
+        "9. JSON Deserialize (1k calls):            {:4} ms ({:.5} us/op, {:.1} B/op)",
         d9.as_millis(),
         d9_us,
         alloc9
