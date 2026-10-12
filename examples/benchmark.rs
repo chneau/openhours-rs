@@ -22,12 +22,55 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static A: CountingAllocator = CountingAllocator;
 
+const TARGET_MS: f64 = 500.0;
+
 fn reset_alloc() -> usize {
     ALLOCATED.swap(0, Ordering::SeqCst)
 }
 
 fn get_alloc() -> usize {
     ALLOCATED.load(Ordering::SeqCst)
+}
+
+/// Runs op(0..base) repeatedly until a batch runs for at least TARGET_MS, then
+/// keeps taking batches until the measured region reaches TARGET_MS. Returns
+/// (measured ms, bytes allocated in the pass, total op count).
+fn measure<F: FnMut(usize)>(base: usize, mut op: F) -> (f64, usize, u64) {
+    let mut reps: u64 = 1;
+    loop {
+        let t0 = Instant::now();
+        for _ in 0..reps {
+            for i in 0..base {
+                op(i);
+            }
+        }
+        let el = t0.elapsed().as_secs_f64() * 1000.0;
+        if el >= TARGET_MS || reps > (1u64 << 34) / base as u64 {
+            break;
+        }
+        let mut next = (reps as f64 * TARGET_MS / el) as u64 + 1;
+        if next <= reps {
+            next = reps + 1;
+        }
+        reps = next;
+    }
+
+    reset_alloc();
+    let t0 = Instant::now();
+    let mut total: u64 = 0;
+    loop {
+        for _ in 0..reps {
+            for i in 0..base {
+                op(i);
+            }
+        }
+        total += reps * base as u64;
+        if t0.elapsed().as_secs_f64() * 1000.0 >= TARGET_MS {
+            break;
+        }
+    }
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    (ms, get_alloc(), total)
 }
 
 fn main() {
@@ -41,8 +84,7 @@ fn main() {
     let fixed_time = Utc.with_ymd_and_hms(2026, 5, 18, 10, 0, 0).unwrap();
     let iterations = 10_000;
     let four_hours = Duration::hours(4);
-    // Multiply iteration counts by this factor so benchmarks run longer and
-    // yield more stable per-op timings across all workloads.
+    // Base workload sizes; each step is repeated until it runs for TARGET_MS.
     let bench_scale = 10;
 
     // Warm-up
@@ -68,171 +110,125 @@ fn main() {
     }
 
     // 1. IsOpen (100k rolling calls)
-    reset_alloc();
-    let t0 = Instant::now();
-    for i in 0..rolling_count {
+    let (ms1, a1, n1) = measure(rolling_count, |i| {
         std::hint::black_box(oh.is_open(std::hint::black_box(&rolling_timeline[i])));
-    }
-    let d1 = t0.elapsed();
-    let alloc1 = get_alloc() as f64 / rolling_count as f64;
-    let d1_us = d1.as_secs_f64() * 1_000_000.0 / rolling_count as f64;
+    });
     println!(
         "1. IsOpen (100k rolling calls):            {:4} ms ({:.5} us/op, {:.1} B/op)",
-        d1.as_millis(),
-        d1_us,
-        alloc1
+        ms1.round() as u64,
+        ms1 * 1000.0 / n1 as f64,
+        a1 as f64 / n1 as f64
     );
 
     // 2. IsOpen (1M pure calls)
-    reset_alloc();
-    let t0 = Instant::now();
-    for _ in 0..(1_000_000 * bench_scale) {
+    let (ms2, a2, n2) = measure(1_000_000 * bench_scale, |_| {
         std::hint::black_box(oh.is_open(std::hint::black_box(&fixed_time)));
-    }
-    let d2 = t0.elapsed();
-    let alloc2 = get_alloc() as f64 / (1_000_000 * bench_scale) as f64;
-    let d2_us = d2.as_secs_f64() * 1_000_000.0 / (1_000_000 * bench_scale) as f64;
+    });
     println!(
         "2. IsOpen (1M pure calls):                 {:4} ms ({:.5} us/op, {:.1} B/op)",
-        d2.as_millis(),
-        d2_us,
-        alloc2
+        ms2.round() as u64,
+        ms2 * 1000.0 / n2 as f64,
+        a2 as f64 / n2 as f64
     );
 
     // 3. GetTimeToOpen (10k calls)
-    reset_alloc();
-    let t0 = Instant::now();
-    for i in 0..(iterations * bench_scale) {
+    let (ms3, a3, n3) = measure(iterations * bench_scale, |i| {
         std::hint::black_box(oh.get_time_to_open(std::hint::black_box(&hour_timeline[i % 168])));
-    }
-    let d3 = t0.elapsed();
-    let alloc3 = get_alloc() as f64 / (iterations * bench_scale) as f64;
-    let d3_us = d3.as_secs_f64() * 1_000_000.0 / (iterations * bench_scale) as f64;
+    });
     println!(
         "3. GetTimeToOpen (10k calls):              {:4} ms ({:.5} us/op, {:.1} B/op)",
-        d3.as_millis(),
-        d3_us,
-        alloc3
+        ms3.round() as u64,
+        ms3 * 1000.0 / n3 as f64,
+        a3 as f64 / n3 as f64
     );
 
     // 4. GetTimeToOpenForDuration 4h (10k calls)
-    reset_alloc();
-    let t0 = Instant::now();
-    for i in 0..(iterations * bench_scale) {
-        std::hint::black_box(oh.get_time_to_open_for_duration(std::hint::black_box(&hour_timeline[i % 168]), std::hint::black_box(four_hours)));
-    }
-    let d4 = t0.elapsed();
-    let alloc4 = get_alloc() as f64 / (iterations * bench_scale) as f64;
-    let d4_us = d4.as_secs_f64() * 1_000_000.0 / (iterations * bench_scale) as f64;
+    let (ms4, a4, n4) = measure(iterations * bench_scale, |i| {
+        std::hint::black_box(oh.get_time_to_open_for_duration(
+            std::hint::black_box(&hour_timeline[i % 168]),
+            std::hint::black_box(four_hours),
+        ));
+    });
     println!(
         "4. GetTimeToOpenForDuration 4h (10k calls):{:4} ms ({:.5} us/op, {:.1} B/op)",
-        d4.as_millis(),
-        d4_us,
-        alloc4
+        ms4.round() as u64,
+        ms4 * 1000.0 / n4 as f64,
+        a4 as f64 / n4 as f64
     );
 
     // 5. When 4h (10k calls)
-    reset_alloc();
-    let t0 = Instant::now();
-    for i in 0..(iterations * bench_scale) {
-        std::hint::black_box(oh.when(std::hint::black_box(&hour_timeline[i % 168]), std::hint::black_box(four_hours)));
-    }
-    let d5 = t0.elapsed();
-    let alloc5 = get_alloc() as f64 / (iterations * bench_scale) as f64;
-    let d5_us = d5.as_secs_f64() * 1_000_000.0 / (iterations * bench_scale) as f64;
+    let (ms5, a5, n5) = measure(iterations * bench_scale, |i| {
+        std::hint::black_box(oh.when(
+            std::hint::black_box(&hour_timeline[i % 168]),
+            std::hint::black_box(four_hours),
+        ));
+    });
     println!(
         "5. When 4h (10k calls):                    {:4} ms ({:.5} us/op, {:.1} B/op)",
-        d5.as_millis(),
-        d5_us,
-        alloc5
+        ms5.round() as u64,
+        ms5 * 1000.0 / n5 as f64,
+        a5 as f64 / n5 as f64
     );
 
     // 6. NextDur (10k calls)
-    reset_alloc();
-    let t0 = Instant::now();
-    for i in 0..(iterations * bench_scale) {
+    let (ms6, a6, n6) = measure(iterations * bench_scale, |i| {
         std::hint::black_box(oh.next_dur(std::hint::black_box(&hour_timeline[i % 168])));
-    }
-    let d6 = t0.elapsed();
-    let alloc6 = get_alloc() as f64 / (iterations * bench_scale) as f64;
-    let d6_us = d6.as_secs_f64() * 1_000_000.0 / (iterations * bench_scale) as f64;
+    });
     println!(
         "6. NextDur (10k calls):                    {:4} ms ({:.5} us/op, {:.1} B/op)",
-        d6.as_millis(),
-        d6_us,
-        alloc6
+        ms6.round() as u64,
+        ms6 * 1000.0 / n6 as f64,
+        a6 as f64 / n6 as f64
     );
 
     // 7. NextDate (10k calls)
-    reset_alloc();
-    let t0 = Instant::now();
-    for i in 0..(iterations * bench_scale) {
+    let (ms7, a7, n7) = measure(iterations * bench_scale, |i| {
         std::hint::black_box(oh.next_date(std::hint::black_box(&hour_timeline[i % 168])));
-    }
-    let d7 = t0.elapsed();
-    let alloc7 = get_alloc() as f64 / (iterations * bench_scale) as f64;
-    let d7_us = d7.as_secs_f64() * 1_000_000.0 / (iterations * bench_scale) as f64;
+    });
     println!(
         "7. NextDate (10k calls):                   {:4} ms ({:.5} us/op, {:.1} B/op)",
-        d7.as_millis(),
-        d7_us,
-        alloc7
+        ms7.round() as u64,
+        ms7 * 1000.0 / n7 as f64,
+        a7 as f64 / n7 as f64
     );
 
     // 8. Parse Cached (1k calls)
-    reset_alloc();
-    let t0 = Instant::now();
-    for _ in 0..(1_000 * bench_scale) {
+    let (ms8, a8, n8) = measure(1_000 * bench_scale, |_| {
         std::hint::black_box(OpenHours::parse(std::hint::black_box(complex_expr)));
-    }
-    let d8 = t0.elapsed();
-    let alloc8 = get_alloc() as f64 / (1_000 * bench_scale) as f64;
-    let d8_us = d8.as_secs_f64() * 1_000_000.0 / (1_000 * bench_scale) as f64;
+    });
     println!(
         "8. Parse Cached (1k calls):                {:4} ms ({:.5} us/op, {:.1} B/op)",
-        d8.as_millis(),
-        d8_us,
-        alloc8
+        ms8.round() as u64,
+        ms8 * 1000.0 / n8 as f64,
+        a8 as f64 / n8 as f64
     );
 
     // 9. JSON Deserialize (1k calls)
-    reset_alloc();
-    let t0 = Instant::now();
-    for _ in 0..(1_000 * bench_scale) {
+    let (ms9, a9, n9) = measure(1_000 * bench_scale, |_| {
         let obj: OpenHours = serde_json::from_str(std::hint::black_box(&json_str)).unwrap();
         std::hint::black_box(obj);
-    }
-    let d9 = t0.elapsed();
-    let alloc9 = get_alloc() as f64 / (1_000 * bench_scale) as f64;
-    let d9_us = d9.as_secs_f64() * 1_000_000.0 / (1_000 * bench_scale) as f64;
+    });
     println!(
         "9. JSON Deserialize (1k calls):            {:4} ms ({:.5} us/op, {:.1} B/op)",
-        d9.as_millis(),
-        d9_us,
-        alloc9
+        ms9.round() as u64,
+        ms9 * 1000.0 / n9 as f64,
+        a9 as f64 / n9 as f64
     );
 
     // 10. Stress Test (5,000 unique objects)
-    reset_alloc();
-    let t0 = Instant::now();
-    let stress_count: usize = 5_000 * bench_scale as usize;
-    let mut locations = Vec::with_capacity(stress_count);
-    for i in 0..stress_count {
+    let (ms10, a10, n10) = measure(5_000 * bench_scale, |i| {
         let h_start = 8 + (i % 60) / 60;
         let m_start = i % 60;
         let h_end = 17 + (i % 60) / 60;
         let m_end = i % 60;
         let expr = format!("Mo-Fr {:02}:{:02}-{:02}:{:02}", h_start, m_start, h_end, m_end);
-        locations.push(OpenHours::parse(&expr));
-    }
-    let d10 = t0.elapsed();
-    let alloc10 = get_alloc() as f64 / stress_count as f64;
-    let d10_ms_obj = d10.as_secs_f64() * 1_000.0 / stress_count as f64;
+        std::hint::black_box(OpenHours::parse(std::hint::black_box(&expr)));
+    });
     println!(
         "10. Stress Test (5,000 unique objects):    {:4} ms ({:.4} ms/obj, {:.1} B/obj)",
-        d10.as_millis(),
-        d10_ms_obj,
-        alloc10
+        ms10.round() as u64,
+        ms10 / n10 as f64,
+        a10 as f64 / n10 as f64
     );
     println!("========================================================");
 }
