@@ -21,26 +21,31 @@ static ALWAYS_OPEN: LazyLock<Arc<OpenHours>> = LazyLock::new(|| {
         bm[BITMASK_WORDS - 1] = (1u64 << rem) - 1;
     }
     Arc::new(OpenHours {
-        raw: "24/7".to_string(),
-        windows: vec![TimeWindow {
+        raw: Arc::from("24/7"),
+        windows: Arc::from(vec![TimeWindow {
             start: 0,
             end: MINUTES_PER_WEEK as u16,
-        }],
+        }]),
         bitmask: bm,
     })
 });
 
 static EMPTY: LazyLock<Arc<OpenHours>> = LazyLock::new(|| {
     Arc::new(OpenHours {
-        raw: String::new(),
-        windows: Vec::new(),
+        raw: Arc::from(""),
+        windows: Arc::from(Vec::<TimeWindow>::new()),
         bitmask: [0u64; BITMASK_WORDS],
     })
 });
 
+/// Most recent intern-pool result for the calling thread, keyed by content hash.
+struct LastEntry {
+    hash: u64,
+    val: Option<Arc<OpenHours>>,
+}
+
 thread_local! {
-    static LAST_HASH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static LAST_VAL: RefCell<Option<Arc<OpenHours>>> = const { RefCell::new(None) };
+    static LAST: RefCell<LastEntry> = const { RefCell::new(LastEntry { hash: 0, val: None }) };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -52,8 +57,8 @@ pub struct TimeWindow {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[repr(align(64))]
 pub struct OpenHours {
-    raw: String,
-    windows: Vec<TimeWindow>,
+    raw: Arc<str>,
+    windows: Arc<[TimeWindow]>,
     bitmask: [u64; BITMASK_WORDS],
 }
 
@@ -69,33 +74,21 @@ impl OpenHours {
             return Arc::clone(&ALWAYS_OPEN);
         }
 
-        // Fast pointer check matching Go's L1 unsafe.StringData check
-        let ptr_hit = LAST_VAL.with(|v| {
-            if let Some(cached) = v.borrow().as_ref() {
+        let hash = std::hash::BuildHasher::hash_one(&rustc_hash::FxBuildHasher, trimmed);
+
+        // 1. Single thread-local cache: pointer-identity fast path (matching Go's L1
+        //    unsafe.StringData check) plus a hash-keyed content check, in one TLS access.
+        let hit = LAST.with(|c| {
+            let c = c.borrow();
+            if let Some(cached) = c.val.as_ref() {
                 if cached.raw.as_ptr() == trimmed.as_ptr() && cached.raw.len() == trimmed.len() {
+                    return Some(Arc::clone(cached));
+                }
+                if c.hash == hash && hash != 0 && &*cached.raw == trimmed {
                     return Some(Arc::clone(cached));
                 }
             }
             None
-        });
-        if let Some(cached) = ptr_hit {
-            return cached;
-        }
-
-        let hash = std::hash::BuildHasher::hash_one(&rustc_hash::FxBuildHasher, trimmed);
-        let hit = LAST_HASH.with(|h| {
-            if h.get() == hash && hash != 0 {
-                LAST_VAL.with(|v| {
-                    if let Some(cached) = v.borrow().as_ref() {
-                        if cached.raw == trimmed {
-                            return Some(Arc::clone(cached));
-                        }
-                    }
-                    None
-                })
-            } else {
-                None
-            }
         });
         if let Some(cached) = hit {
             return cached;
@@ -106,8 +99,7 @@ impl OpenHours {
             let pool = INTERN_POOL.read();
             if let Some(cached) = pool.get(trimmed) {
                 let arc = Arc::clone(cached);
-                LAST_HASH.with(|h| h.set(hash));
-                LAST_VAL.with(|v| *v.borrow_mut() = Some(Arc::clone(&arc)));
+                Self::remember(&arc, hash);
                 return arc;
             }
         }
@@ -116,9 +108,18 @@ impl OpenHours {
         let parsed = Arc::new(Self::parse_uncached(trimmed));
         let mut pool = INTERN_POOL.write();
         pool.insert(trimmed.to_string(), Arc::clone(&parsed));
-        LAST_HASH.with(|h| h.set(hash));
-        LAST_VAL.with(|v| *v.borrow_mut() = Some(Arc::clone(&parsed)));
+        Self::remember(&parsed, hash);
         parsed
+    }
+
+    /// Records `arc` as the calling thread's most recent intern-pool result.
+    #[inline]
+    fn remember(arc: &Arc<Self>, hash: u64) {
+        LAST.with(|c| {
+            let mut c = c.borrow_mut();
+            c.hash = hash;
+            c.val = Some(Arc::clone(arc));
+        });
     }
 
     /// Returns the raw OSM expression.
@@ -148,15 +149,12 @@ impl OpenHours {
     }
 
     /// Ultra-fast $O(1)$ scalar hardware bit testing using 64-bit integer timestamp math.
+    ///
+    /// The baked bitmask is the single source of truth for open/closed state: it is
+    /// all-zero for an empty schedule and covers every minute of the week for `24/7`,
+    /// so no separate empty / always-open branch is required.
     #[inline(always)]
     pub fn is_open<Tz: TimeZone>(&self, dt: &DateTime<Tz>) -> bool {
-        if self.windows.is_empty() {
-            return false;
-        }
-        if self.is_always_open() {
-            return true;
-        }
-
         let local_secs = (dt.timestamp() + dt.offset().fix().local_minus_utc() as i64) as u64;
         let week_min = ((local_secs / 60 + 4320) % (MINUTES_PER_WEEK as u64)) as usize;
         let word = week_min >> 6;
@@ -167,13 +165,6 @@ impl OpenHours {
     /// Point-in-time check for NaiveDateTime.
     #[inline(always)]
     pub fn is_open_naive(&self, dt: &NaiveDateTime) -> bool {
-        if self.windows.is_empty() {
-            return false;
-        }
-        if self.is_always_open() {
-            return true;
-        }
-
         let week_min = Self::get_week_minute_naive(dt.weekday(), dt.hour(), dt.minute());
         let word = week_min >> 6;
         let mask = 1u64 << (week_min & 63);
@@ -205,12 +196,10 @@ impl OpenHours {
                 return Some(Duration::zero());
             }
             let diff_min = (w.start as usize) - t;
-            let total_nanos = (diff_min as i64 * 60 - sub_seconds) * 1_000_000_000 - sub_nanos;
-            Some(Duration::nanoseconds(total_nanos))
+            Some(Self::duration_minus_sub(diff_min, sub_seconds, sub_nanos))
         } else {
             let diff_min = (MINUTES_PER_WEEK - t) + (unsafe { self.windows.get_unchecked(0).start } as usize);
-            let total_nanos = (diff_min as i64 * 60 - sub_seconds) * 1_000_000_000 - sub_nanos;
-            Some(Duration::nanoseconds(total_nanos))
+            Some(Self::duration_minus_sub(diff_min, sub_seconds, sub_nanos))
         }
     }
 
@@ -260,8 +249,7 @@ impl OpenHours {
             } else {
                 if effective_end - (w.start as usize) >= req_minutes {
                     let diff_min = (w.start as usize) - t;
-                    let total_nanos = (diff_min as i64 * 60 - sub_seconds) * 1_000_000_000 - sub_nanos;
-                    return Some(Duration::nanoseconds(total_nanos));
+                    return Some(Self::duration_minus_sub(diff_min, sub_seconds, sub_nanos));
                 }
             }
         }
@@ -276,8 +264,7 @@ impl OpenHours {
 
             if effective_end - (w.start as usize) >= req_minutes {
                 let diff_min = (MINUTES_PER_WEEK - t) + (w.start as usize);
-                let total_nanos = (diff_min as i64 * 60 - sub_seconds) * 1_000_000_000 - sub_nanos;
-                return Some(Duration::nanoseconds(total_nanos));
+                return Some(Self::duration_minus_sub(diff_min, sub_seconds, sub_nanos));
             }
         }
 
@@ -320,8 +307,7 @@ impl OpenHours {
             diff_min = (MINUTES_PER_WEEK - t) + (unsafe { self.windows.get_unchecked(0).end } as usize);
         }
 
-        let total_nanos = (diff_min as i64 * 60 - sub_seconds) * 1_000_000_000 - sub_nanos;
-        dt.clone().checked_add_signed(Duration::nanoseconds(total_nanos))
+        dt.clone().checked_add_signed(Self::duration_minus_sub(diff_min, sub_seconds, sub_nanos))
     }
 
     /// Returns (is_currently_open, duration_until_next_state_change).
@@ -348,19 +334,16 @@ impl OpenHours {
                 {
                     diff_min = (MINUTES_PER_WEEK - t) + (unsafe { self.windows.get_unchecked(0).end } as usize);
                 }
-                let total_nanos = (diff_min as i64 * 60 - sub_seconds) * 1_000_000_000 - sub_nanos;
-                return (true, Duration::nanoseconds(total_nanos));
+                return (true, Self::duration_minus_sub(diff_min, sub_seconds, sub_nanos));
             }
             // Currently closed, opens at w.start
             let diff_min = (w.start as usize) - t;
-            let total_nanos = (diff_min as i64 * 60 - sub_seconds) * 1_000_000_000 - sub_nanos;
-            return (false, Duration::nanoseconds(total_nanos));
+            return (false, Self::duration_minus_sub(diff_min, sub_seconds, sub_nanos));
         }
 
         // Currently closed, opens at windows[0].start next week
         let diff_min = (MINUTES_PER_WEEK - t) + (unsafe { self.windows.get_unchecked(0).start } as usize);
-        let total_nanos = (diff_min as i64 * 60 - sub_seconds) * 1_000_000_000 - sub_nanos;
-        (false, Duration::nanoseconds(total_nanos))
+        (false, Self::duration_minus_sub(diff_min, sub_seconds, sub_nanos))
     }
 
     /// Returns (is_currently_open, next_transition_timestamp).
@@ -388,29 +371,26 @@ impl OpenHours {
                 {
                     diff_min = (MINUTES_PER_WEEK - t) + (unsafe { self.windows.get_unchecked(0).end } as usize);
                 }
-                let total_nanos = (diff_min as i64 * 60 - sub_seconds) * 1_000_000_000 - sub_nanos;
                 let next_dt = dt
                     .clone()
-                    .checked_add_signed(Duration::nanoseconds(total_nanos))
+                    .checked_add_signed(Self::duration_minus_sub(diff_min, sub_seconds, sub_nanos))
                     .unwrap_or_else(|| dt.clone());
                 return (true, next_dt);
             }
             // Currently closed, opens at w.start
             let diff_min = (w.start as usize) - t;
-            let total_nanos = (diff_min as i64 * 60 - sub_seconds) * 1_000_000_000 - sub_nanos;
             let next_dt = dt
                 .clone()
-                .checked_add_signed(Duration::nanoseconds(total_nanos))
+                .checked_add_signed(Self::duration_minus_sub(diff_min, sub_seconds, sub_nanos))
                 .unwrap_or_else(|| dt.clone());
             return (false, next_dt);
         }
 
         // Currently closed, opens at windows[0].start next week
         let diff_min = (MINUTES_PER_WEEK - t) + (unsafe { self.windows.get_unchecked(0).start } as usize);
-        let total_nanos = (diff_min as i64 * 60 - sub_seconds) * 1_000_000_000 - sub_nanos;
         let next_dt = dt
             .clone()
-            .checked_add_signed(Duration::nanoseconds(total_nanos))
+            .checked_add_signed(Self::duration_minus_sub(diff_min, sub_seconds, sub_nanos))
             .unwrap_or_else(|| dt.clone());
         (false, next_dt)
     }
@@ -428,13 +408,6 @@ impl OpenHours {
 
     #[inline(always)]
     pub fn is_open_utc(&self, dt: &DateTime<chrono::Utc>) -> bool {
-        if self.windows.is_empty() {
-            return false;
-        }
-        if self.is_always_open() {
-            return true;
-        }
-
         let local_secs = dt.timestamp() as u64;
         let week_min = ((local_secs / 60 + 4320) % (MINUTES_PER_WEEK as u64)) as usize;
         let word = week_min >> 6;
@@ -450,7 +423,7 @@ impl OpenHours {
 
     #[inline(always)]
     fn find_first_window_starting_at_or_after(&self, t: usize) -> usize {
-        let windows = self.windows.as_slice();
+        let windows: &[TimeWindow] = &self.windows;
         let n = windows.len();
         match n {
             0 => 0,
@@ -517,7 +490,10 @@ impl OpenHours {
     }
 
     fn parse_uncached(expression: &str) -> Self {
-        let mut minutes = [false; MINUTES_PER_WEEK];
+        // Accumulate open minutes directly into the week bitmask (158 words) instead of a
+        // one-byte-per-minute scratch array, so the per-parse cost scales with the number
+        // of rules rather than with MINUTES_PER_WEEK.
+        let mut bm = [0u64; BITMASK_WORDS];
         let bytes = expression.as_bytes();
         let mut rule_start = 0;
 
@@ -569,57 +545,141 @@ impl OpenHours {
             for &day in &days[..num_days] {
                 for &(start, end) in &intervals[..num_intervals] {
                     let start_min = day * 1440 + start;
-                    if end > 1440 {
-                        let actual_end = day * 1440 + end;
-                        for m in start_min..actual_end {
-                            minutes[m % MINUTES_PER_WEEK] = !is_off;
-                        }
+                    let (lo, hi) = if end > 1440 {
+                        (start_min, day * 1440 + end)
                     } else if start > end {
-                        let actual_end = (day + 1) * 1440 + end;
-                        for m in start_min..actual_end {
-                            minutes[m % MINUTES_PER_WEEK] = !is_off;
-                        }
+                        (start_min, (day + 1) * 1440 + end)
                     } else {
-                        let end_min = day * 1440 + end;
-                        for m in start_min..end_min {
-                            minutes[m % MINUTES_PER_WEEK] = !is_off;
+                        (start_min, day * 1440 + end)
+                    };
+                    Self::apply_minute_range(&mut bm, lo, hi, !is_off);
+                }
+            }
+        }
+
+        // Bake disjoint windows by scanning the bitmask one word at a time. Only words that
+        // straddle a window boundary are walked bit-by-bit; all-zero/all-one words are O(1).
+        let mut win_list: Vec<TimeWindow> = Vec::with_capacity(16);
+        let mut run_start = usize::MAX;
+        for (wi, &w) in bm.iter().enumerate() {
+            let base = wi << 6;
+            if w == 0 {
+                if run_start != usize::MAX {
+                    win_list.push(TimeWindow {
+                        start: run_start as u16,
+                        end: base as u16,
+                    });
+                    run_start = usize::MAX;
+                }
+            } else if w == !0u64 {
+                if run_start == usize::MAX {
+                    run_start = base;
+                }
+            } else {
+                let mut bit = 0usize;
+                while bit < 64 {
+                    if (w >> bit) & 1 != 0 {
+                        if run_start == usize::MAX {
+                            run_start = base + bit;
                         }
+                    } else if run_start != usize::MAX {
+                        win_list.push(TimeWindow {
+                            start: run_start as u16,
+                            end: (base + bit) as u16,
+                        });
+                        run_start = usize::MAX;
                     }
+                    bit += 1;
                 }
             }
         }
-
-        // Bake into disjoint windows and bitmask
-        let mut bm = [0u64; BITMASK_WORDS];
-        let mut win_list = Vec::with_capacity(16);
-        let mut in_window_start: Option<usize> = None;
-
-        for (i, &open) in minutes.iter().enumerate() {
-            if open {
-                bm[i >> 6] |= 1u64 << (i & 63);
-                if in_window_start.is_none() {
-                    in_window_start = Some(i);
-                }
-            } else if let Some(start) = in_window_start {
-                win_list.push(TimeWindow {
-                    start: start as u16,
-                    end: i as u16,
-                });
-                in_window_start = None;
-            }
-        }
-        if let Some(start) = in_window_start {
+        if run_start != usize::MAX {
             win_list.push(TimeWindow {
-                start: start as u16,
+                start: run_start as u16,
                 end: MINUTES_PER_WEEK as u16,
             });
         }
         win_list.shrink_to_fit();
-
         OpenHours {
-            raw: expression.to_string(),
-            windows: win_list,
+            raw: Arc::from(expression),
+            windows: Arc::from(win_list),
             bitmask: bm,
+        }
+    }
+
+    /// Applies `value` to minute range `[lo, hi)`, wrapping around the week boundary.
+    #[inline(always)]
+    fn apply_minute_range(bm: &mut [u64; BITMASK_WORDS], lo: usize, hi: usize, value: bool) {
+        if lo >= hi {
+            return;
+        }
+        let n = hi - lo; // always < MINUTES_PER_WEEK by construction
+        let lo_wrapped = lo % MINUTES_PER_WEEK;
+        if lo_wrapped + n <= MINUTES_PER_WEEK {
+            Self::apply_bit_range(bm, lo_wrapped, lo_wrapped + n, value);
+        } else {
+            Self::apply_bit_range(bm, lo_wrapped, MINUTES_PER_WEEK, value);
+            Self::apply_bit_range(bm, 0, lo_wrapped + n - MINUTES_PER_WEEK, value);
+        }
+    }
+
+    /// Sets or clears every bit in `[lo, hi)`; `hi <= MINUTES_PER_WEEK`.
+    #[inline]
+    fn apply_bit_range(bm: &mut [u64; BITMASK_WORDS], lo: usize, hi: usize, value: bool) {
+        if lo >= hi {
+            return;
+        }
+        let first_word = lo >> 6;
+        let last_word = (hi - 1) >> 6;
+        if first_word == last_word {
+            let mask = Self::bit_mask(lo & 63, hi - lo);
+            if value {
+                bm[first_word] |= mask;
+            } else {
+                bm[first_word] &= !mask;
+            }
+            return;
+        }
+        let head_mask = !0u64 << (lo & 63);
+        if value {
+            bm[first_word] |= head_mask;
+        } else {
+            bm[first_word] &= !head_mask;
+        }
+        for w in &mut bm[first_word + 1..last_word] {
+            *w = if value { !0u64 } else { 0 };
+        }
+        let tail_mask = Self::bit_mask(0, ((hi - 1) & 63) + 1);
+        if value {
+            bm[last_word] |= tail_mask;
+        } else {
+            bm[last_word] &= !tail_mask;
+        }
+    }
+
+    /// `len` consecutive bits starting at `offset` (offset + len <= 64).
+    #[inline(always)]
+    fn bit_mask(offset: usize, len: usize) -> u64 {
+        if len == 64 {
+            !0u64
+        } else {
+            ((1u64 << len) - 1) << offset
+        }
+    }
+
+    /// Builds the `Duration` for `diff_min` whole minutes minus the sub-minute remainder
+    /// `sub_seconds`/`sub_nanos` of the query instant.
+    ///
+    /// Equivalent to `Duration::nanoseconds((diff_min * 60 - sub_seconds) * 1e9 - sub_nanos)`
+    /// for `diff_min >= 1` and `0 <= sub_seconds < 60`, `0 <= sub_nanos < 1e9`, but the seconds
+    /// and nanoseconds are produced directly so no 64-bit division by `1e9` is needed.
+    #[inline(always)]
+    fn duration_minus_sub(diff_min: usize, sub_seconds: i64, sub_nanos: i64) -> Duration {
+        let secs = diff_min as i64 * 60 - sub_seconds;
+        if sub_nanos == 0 {
+            Duration::seconds(secs)
+        } else {
+            Duration::new(secs - 1, (1_000_000_000 - sub_nanos) as u32).unwrap()
         }
     }
 
