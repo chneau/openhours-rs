@@ -21,31 +21,32 @@ static ALWAYS_OPEN: LazyLock<Arc<OpenHours>> = LazyLock::new(|| {
         bm[BITMASK_WORDS - 1] = (1u64 << rem) - 1;
     }
     Arc::new(OpenHours {
-        raw: Arc::from("24/7"),
-        windows: Arc::from(vec![TimeWindow {
-            start: 0,
-            end: MINUTES_PER_WEEK as u16,
-        }]),
-        bitmask: bm,
+        inner: Arc::new(OpenHoursInner {
+            raw: Arc::from("24/7"),
+            windows: Arc::from(vec![TimeWindow {
+                start: 0,
+                end: MINUTES_PER_WEEK as u16,
+            }]),
+            bitmask: bm,
+        }),
     })
 });
 
 static EMPTY: LazyLock<Arc<OpenHours>> = LazyLock::new(|| {
     Arc::new(OpenHours {
-        raw: Arc::from(""),
-        windows: Arc::from(Vec::<TimeWindow>::new()),
-        bitmask: [0u64; BITMASK_WORDS],
+        inner: Arc::new(OpenHoursInner {
+            raw: Arc::from(""),
+            windows: Arc::from(Vec::<TimeWindow>::new()),
+            bitmask: [0u64; BITMASK_WORDS],
+        }),
     })
 });
 
-/// Most recent intern-pool result for the calling thread, keyed by content hash.
-struct LastEntry {
-    hash: u64,
-    val: Option<Arc<OpenHours>>,
-}
-
 thread_local! {
-    static LAST: RefCell<LastEntry> = const { RefCell::new(LastEntry { hash: 0, val: None }) };
+    /// Most recent intern-pool result for the calling thread. The cached `Arc`'s own
+    /// `raw` allocation is both the value and the identity key, so the hit path needs
+    /// no content hash — a length check plus a slice comparison fully guards it.
+    static LAST: RefCell<Option<Arc<OpenHours>>> = const { RefCell::new(None) };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -56,10 +57,30 @@ pub struct TimeWindow {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[repr(align(64))]
-pub struct OpenHours {
+#[doc(hidden)]
+pub struct OpenHoursInner {
     raw: Arc<str>,
     windows: Arc<[TimeWindow]>,
     bitmask: [u64; BITMASK_WORDS],
+}
+
+/// An interned OSM `opening_hours` schedule.
+///
+/// The entire payload lives behind a single `Arc`, so cloning an `OpenHours` (as the
+/// `Deserialize` impl does) is one refcount bump. Field access transparently dereferences
+/// into [`OpenHoursInner`], so the hot `bitmask` lookup stays a single indirection.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OpenHours {
+    inner: Arc<OpenHoursInner>,
+}
+
+impl std::ops::Deref for OpenHours {
+    type Target = OpenHoursInner;
+
+    #[inline(always)]
+    fn deref(&self) -> &OpenHoursInner {
+        &self.inner
+    }
 }
 
 impl OpenHours {
@@ -74,17 +95,12 @@ impl OpenHours {
             return Arc::clone(&ALWAYS_OPEN);
         }
 
-        let hash = std::hash::BuildHasher::hash_one(&rustc_hash::FxBuildHasher, trimmed);
-
-        // 1. Single thread-local cache: pointer-identity fast path (matching Go's L1
-        //    unsafe.StringData check) plus a hash-keyed content check, in one TLS access.
+        // 1. Single thread-local cache: the cached `Arc`'s own `raw` slice is the key, so
+        //    the hit path is a length check plus one comparison — no rehashing required.
         let hit = LAST.with(|c| {
             let c = c.borrow();
-            if let Some(cached) = c.val.as_ref() {
-                if cached.raw.as_ptr() == trimmed.as_ptr() && cached.raw.len() == trimmed.len() {
-                    return Some(Arc::clone(cached));
-                }
-                if c.hash == hash && hash != 0 && &*cached.raw == trimmed {
+            if let Some(cached) = c.as_ref() {
+                if cached.raw.len() == trimmed.len() && &*cached.raw == trimmed {
                     return Some(Arc::clone(cached));
                 }
             }
@@ -99,7 +115,7 @@ impl OpenHours {
             let pool = INTERN_POOL.read();
             if let Some(cached) = pool.get(trimmed) {
                 let arc = Arc::clone(cached);
-                Self::remember(&arc, hash);
+                Self::remember(&arc);
                 return arc;
             }
         }
@@ -108,17 +124,15 @@ impl OpenHours {
         let parsed = Arc::new(Self::parse_uncached(trimmed));
         let mut pool = INTERN_POOL.write();
         pool.insert(trimmed.to_string(), Arc::clone(&parsed));
-        Self::remember(&parsed, hash);
+        Self::remember(&parsed);
         parsed
     }
 
     /// Records `arc` as the calling thread's most recent intern-pool result.
     #[inline]
-    fn remember(arc: &Arc<Self>, hash: u64) {
+    fn remember(arc: &Arc<Self>) {
         LAST.with(|c| {
-            let mut c = c.borrow_mut();
-            c.hash = hash;
-            c.val = Some(Arc::clone(arc));
+            *c.borrow_mut() = Some(Arc::clone(arc));
         });
     }
 
@@ -601,9 +615,11 @@ impl OpenHours {
         }
         win_list.shrink_to_fit();
         OpenHours {
-            raw: Arc::from(expression),
-            windows: Arc::from(win_list),
-            bitmask: bm,
+            inner: Arc::new(OpenHoursInner {
+                raw: Arc::from(expression),
+                windows: Arc::from(win_list),
+                bitmask: bm,
+            }),
         }
     }
 
