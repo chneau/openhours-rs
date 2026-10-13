@@ -331,6 +331,27 @@ impl OpenHours {
 
         let (t, sub_seconds, sub_nanos) = Self::get_week_minute_and_sub(from);
         let sub_dur_nanos = sub_seconds * 1_000_000_000 + sub_nanos;
+
+        // Successor-table fast path: for a minute `t`, `succ[t]` already holds the
+        // open flag and the distance to the next state change. This resolves the two
+        // common cases without the lower-bound search: (a) already open with enough
+        // time left in the current window, and (b) closed with the very next window
+        // long enough — the next window's length is `succ` at that window's start.
+        let e = unsafe { *self.succ_table().get_unchecked(t) };
+        let dist = (e & CHANGE_MASK) as usize;
+        if e & OPEN_FLAG != 0 {
+            if dist as i64 * 60_000_000_000 - sub_dur_nanos >= req_nanos {
+                return Some(Duration::zero());
+            }
+        } else {
+            let start_m = (t + dist) % MINUTES_PER_WEEK;
+            let next_len =
+                (unsafe { *self.succ_table().get_unchecked(start_m) } & CHANGE_MASK) as usize;
+            if next_len >= req_minutes {
+                return Some(Self::duration_minus_sub(dist, sub_seconds, sub_nanos));
+            }
+        }
+
         let start_idx = self.find_first_window_starting_at_or_after(t);
 
         let n = self.windows.len();
