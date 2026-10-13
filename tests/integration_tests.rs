@@ -1,5 +1,5 @@
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use openhours::OpenHours;
+use openhours::{OpenHours, TimeWindow, MINUTES_PER_WEEK};
 use std::thread;
 
 fn monday_midnight() -> DateTime<Utc> {
@@ -327,4 +327,226 @@ fn test_advanced_day_syntax() {
     assert!(mo.is_open(&base));
     assert!(mo.is_open(&(base + Duration::hours(23) + Duration::minutes(59))));
     assert!(!mo.is_open(&(base + Duration::hours(24))));
+}
+
+// ---------------------------------------------------------------------------
+// Differential test: the lazy per-minute `succ`/`widx` tables must reproduce,
+// bit for bit, the lower-bound window search they replaced. The reference
+// functions below are a faithful copy of the pre-optimization algorithm,
+// derived only from `windows()`.
+// ---------------------------------------------------------------------------
+
+fn ref_first(windows: &[TimeWindow], t: usize) -> usize {
+    let mut i = 0;
+    while i < windows.len() && (windows[i].end as usize) <= t {
+        i += 1;
+    }
+    i
+}
+
+/// Copy of `OpenHours::duration_minus_sub`.
+fn ref_dur(diff_min: usize, sub_seconds: i64, sub_nanos: i64) -> Duration {
+    let secs = diff_min as i64 * 60 - sub_seconds;
+    if sub_nanos == 0 {
+        Duration::seconds(secs)
+    } else {
+        Duration::new(secs - 1, (1_000_000_000 - sub_nanos) as u32).unwrap()
+    }
+}
+
+fn ref_time_to_open(oh: &OpenHours, t: usize, ss: i64, sn: i64) -> Option<Duration> {
+    let w = oh.windows();
+    if w.is_empty() {
+        return None;
+    }
+    if oh.is_always_open() {
+        return Some(Duration::zero());
+    }
+    let n = w.len();
+    let idx = ref_first(w, t);
+    let diff = if idx < n {
+        if (w[idx].start as usize) <= t {
+            return Some(Duration::zero());
+        }
+        (w[idx].start as usize) - t
+    } else {
+        (MINUTES_PER_WEEK - t) + (w[0].start as usize)
+    };
+    Some(ref_dur(diff, ss, sn))
+}
+
+fn ref_next_dur(oh: &OpenHours, t: usize, ss: i64, sn: i64) -> (bool, Duration) {
+    let w = oh.windows();
+    if w.is_empty() {
+        return (false, Duration::zero());
+    }
+    if oh.is_always_open() {
+        return (true, Duration::days(365));
+    }
+    let n = w.len();
+    let idx = ref_first(w, t);
+    if idx < n {
+        if (w[idx].start as usize) <= t {
+            let mut diff = (w[idx].end as usize) - t;
+            if idx == n - 1 && w[idx].end as usize == MINUTES_PER_WEEK && w[0].start == 0 {
+                diff = (MINUTES_PER_WEEK - t) + (w[0].end as usize);
+            }
+            return (true, ref_dur(diff, ss, sn));
+        }
+        return (false, ref_dur((w[idx].start as usize) - t, ss, sn));
+    }
+    (false, ref_dur((MINUTES_PER_WEEK - t) + (w[0].start as usize), ss, sn))
+}
+
+fn ref_current_shift_end(oh: &OpenHours, t: usize, ss: i64, sn: i64) -> Option<Duration> {
+    let w = oh.windows();
+    if w.is_empty() {
+        return None;
+    }
+    if oh.is_always_open() {
+        return Some(Duration::weeks(52));
+    }
+    let n = w.len();
+    let idx = ref_first(w, t);
+    if idx >= n || (w[idx].start as usize) > t {
+        return None;
+    }
+    let mut diff = (w[idx].end as usize) - t;
+    if idx == n - 1 && w[idx].end as usize == MINUTES_PER_WEEK && w[0].start == 0 {
+        diff = (MINUTES_PER_WEEK - t) + (w[0].end as usize);
+    }
+    Some(ref_dur(diff, ss, sn))
+}
+
+fn ref_time_to_open_for_duration(
+    oh: &OpenHours,
+    t: usize,
+    ss: i64,
+    sn: i64,
+    required: Duration,
+) -> Option<Duration> {
+    let w = oh.windows();
+    if w.is_empty() {
+        return None;
+    }
+    let req_nanos = required.num_nanoseconds().unwrap_or(0);
+    if req_nanos <= 0 {
+        return Some(Duration::zero());
+    }
+    let req_minutes = ((required.num_seconds() + 59) / 60) as usize;
+    if req_minutes > MINUTES_PER_WEEK {
+        return None;
+    }
+    if oh.is_always_open() {
+        return Some(Duration::zero());
+    }
+    let sub_dur_nanos = ss * 1_000_000_000 + sn;
+    let n = w.len();
+    let start_idx = ref_first(w, t);
+    let last_ends = w[n - 1].end as usize == MINUTES_PER_WEEK;
+    let first_zero = w[0].start == 0;
+    for i in start_idx..n {
+        let effective_end = if i == n - 1 && last_ends && first_zero {
+            MINUTES_PER_WEEK + (w[0].end as usize)
+        } else {
+            w[i].end as usize
+        };
+        if t >= (w[i].start as usize) {
+            let rem_nanos = ((effective_end - t) as i64) * 60_000_000_000 - sub_dur_nanos;
+            if rem_nanos >= req_nanos {
+                return Some(Duration::zero());
+            }
+        } else if effective_end - (w[i].start as usize) >= req_minutes {
+            return Some(ref_dur((w[i].start as usize) - t, ss, sn));
+        }
+    }
+    for i in 0..n {
+        let effective_end = if i == n - 1 && last_ends && first_zero {
+            MINUTES_PER_WEEK + (w[0].end as usize)
+        } else {
+            w[i].end as usize
+        };
+        if effective_end - (w[i].start as usize) >= req_minutes {
+            return Some(ref_dur((MINUTES_PER_WEEK - t) + (w[i].start as usize), ss, sn));
+        }
+    }
+    None
+}
+
+#[test]
+fn test_per_minute_tables_match_reference_search() {
+    let base = monday_midnight();
+    let expressions = [
+        "Mo-Fr 08:00-12:00, 13:00-17:00; Sa 08:00-12:00",
+        "Mo 08:00-18:00",
+        "Mo 22:00-04:00",
+        "Su 22:00-04:00",
+        "Mo-Su 00:00-24:00; Tu 12:00-13:00 off",
+        "Mo-Su 08:00-16:00",
+        "Sa-Su 10:00-02:00",
+        "Mo-Tu,Th,Fr 06:00-22:00",
+        "24/7",
+    ];
+    // (sub_seconds, sub_nanos) query instants within each minute.
+    let subs: [(i64, i64); 4] = [(0, 0), (30, 0), (0, 500_000_000), (59, 999_999_999)];
+    let reqs = [
+        Duration::nanoseconds(1),
+        Duration::minutes(90),
+        Duration::hours(4),
+        Duration::weeks(1),
+    ];
+
+    for expr in expressions {
+        let oh = OpenHours::parse(expr);
+        for minute in 0..MINUTES_PER_WEEK {
+            for (ss, sn) in subs {
+                let dt = base
+                    + Duration::minutes(minute as i64)
+                    + Duration::seconds(ss)
+                    + Duration::nanoseconds(sn);
+
+                assert_eq!(
+                    oh.get_time_to_open(&dt),
+                    ref_time_to_open(&oh, minute, ss, sn),
+                    "get_time_to_open {expr} m={minute} ss={ss} sn={sn}"
+                );
+                assert_eq!(
+                    oh.next_dur(&dt),
+                    ref_next_dur(&oh, minute, ss, sn),
+                    "next_dur {expr} m={minute} ss={ss} sn={sn}"
+                );
+                let ref_shift = ref_current_shift_end(&oh, minute, ss, sn);
+                let got_shift = oh.get_current_shift_end(&dt).map(|d| d - dt.clone());
+                assert_eq!(got_shift, ref_shift, "shift_end {expr} m={minute} ss={ss} sn={sn}");
+
+                // next_date / when built from the reference duration.
+                let rnd = ref_next_dur(&oh, minute, ss, sn);
+                let expected_date = if rnd.1.is_zero() {
+                    dt.clone()
+                } else {
+                    dt.clone() + rnd.1
+                };
+                assert_eq!(
+                    oh.next_date(&dt),
+                    (rnd.0, expected_date),
+                    "next_date {expr} m={minute} ss={ss} sn={sn}"
+                );
+
+                for req in reqs {
+                    let r = ref_time_to_open_for_duration(&oh, minute, ss, sn, req);
+                    assert_eq!(
+                        oh.get_time_to_open_for_duration(&dt, req),
+                        r,
+                        "dur {expr} m={minute} ss={ss} sn={sn} req={req:?}"
+                    );
+                    let expected_when = r.map(|w| if w.is_zero() { dt.clone() } else { dt.clone() + w });
+                    assert_eq!(
+                        oh.when(&dt, req),
+                        expected_when,
+                        "when {expr} m={minute} ss={ss} sn={sn} req={req:?}"
+                    );
+                }
+            }
+        }
+    }
 }

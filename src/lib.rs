@@ -6,10 +6,16 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cell::RefCell;
 use std::fmt;
 use std::str::FromStr;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 pub const MINUTES_PER_WEEK: usize = 7 * 24 * 60; // 10,080
 pub const BITMASK_WORDS: usize = (MINUTES_PER_WEEK + 63) / 64; // 158
+
+/// High bit of a packed `succ` entry: set when the week-minute is open.
+const OPEN_FLAG: u16 = 0x8000;
+/// Low 15 bits of a packed `succ` entry: minutes to the next state change.
+/// The largest possible value is `(MINUTES_PER_WEEK - 1) + (MINUTES_PER_WEEK - 1) < 2^15`.
+const CHANGE_MASK: u16 = 0x7fff;
 
 static INTERN_POOL: LazyLock<RwLock<FxHashMap<String, Arc<OpenHours>>>> =
     LazyLock::new(|| RwLock::new(FxHashMap::default()));
@@ -28,6 +34,7 @@ static ALWAYS_OPEN: LazyLock<Arc<OpenHours>> = LazyLock::new(|| {
                 end: MINUTES_PER_WEEK as u16,
             }]),
             bitmask: bm,
+            succ: OnceLock::new(),
         }),
     })
 });
@@ -38,6 +45,7 @@ static EMPTY: LazyLock<Arc<OpenHours>> = LazyLock::new(|| {
             raw: Arc::from(""),
             windows: Arc::from(Vec::<TimeWindow>::new()),
             bitmask: [0u64; BITMASK_WORDS],
+            succ: OnceLock::new(),
         }),
     })
 });
@@ -47,6 +55,9 @@ thread_local! {
     /// `raw` allocation is both the value and the identity key, so the hit path needs
     /// no content hash — a length check plus a slice comparison fully guards it.
     static LAST: RefCell<Option<Arc<OpenHours>>> = const { RefCell::new(None) };
+    /// Content-keyed memo of the last JSON string decoded on this thread. It is keyed by
+    /// content (never pointer identity), so a reused buffer with different bytes misses.
+    static LAST_JSON: RefCell<Option<(Box<str>, Arc<OpenHoursInner>)>> = const { RefCell::new(None) };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -55,13 +66,30 @@ pub struct TimeWindow {
     pub end: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[repr(align(64))]
 #[doc(hidden)]
 pub struct OpenHoursInner {
     raw: Arc<str>,
     windows: Arc<[TimeWindow]>,
     bitmask: [u64; BITMASK_WORDS],
+    /// Lazily built per-minute successor table. `succ[m]` packs the answer for the
+    /// week-minute `m`: bit 15 is the open flag, bits 0..14 hold the number of minutes
+    /// until the next state change (window start when closed, window end / week-wrap
+    /// when open). It is a pure function of `windows`, so it is bit-identical to the
+    /// former lower-bound search, and being lazy means parse-only workloads never build it.
+    succ: OnceLock<Box<[u16]>>,
+}
+
+impl std::hash::Hash for OpenHoursInner {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // The lazy tables are derived from `windows`, so they are excluded to keep
+        // hashing deterministic regardless of whether a query has run.
+        self.raw.hash(state);
+        self.windows.hash(state);
+        self.bitmask.hash(state);
+    }
 }
 
 /// An interned OSM `opening_hours` schedule.
@@ -136,6 +164,76 @@ impl OpenHours {
         });
     }
 
+    /// Like [`parse`](Self::parse), but returns an owned [`OpenHours`] that shares the
+    /// interned payload through a *single* inner-`Arc` clone. On a cache hit this avoids
+    /// the extra `Arc` bump that `(*parse(expr)).clone()` would perform, which is exactly
+    /// the `Deserialize` fast path.
+    #[inline]
+    pub fn parse_owned(expression: &str) -> Self {
+        let trimmed = Self::trim_ascii_str(expression);
+        if trimmed.is_empty() {
+            return OpenHours {
+                inner: Arc::clone(&EMPTY.inner),
+            };
+        }
+        if trimmed.len() == 4 && trimmed.eq_ignore_ascii_case("24/7") {
+            return OpenHours {
+                inner: Arc::clone(&ALWAYS_OPEN.inner),
+            };
+        }
+
+        let hit = LAST.with(|c| {
+            let c = c.borrow();
+            if let Some(cached) = c.as_ref() {
+                if cached.raw.len() == trimmed.len() && &*cached.raw == trimmed {
+                    return Some(Arc::clone(&cached.inner));
+                }
+            }
+            None
+        });
+        if let Some(inner) = hit {
+            return OpenHours { inner };
+        }
+
+        {
+            let pool = INTERN_POOL.read();
+            if let Some(cached) = pool.get(trimmed) {
+                let inner = Arc::clone(&cached.inner);
+                Self::remember(cached);
+                return OpenHours { inner };
+            }
+        }
+
+        let parsed = Arc::new(Self::parse_uncached(trimmed));
+        let inner = Arc::clone(&parsed.inner);
+        let mut pool = INTERN_POOL.write();
+        pool.insert(trimmed.to_string(), Arc::clone(&parsed));
+        drop(pool);
+        Self::remember(&parsed);
+        OpenHours { inner }
+    }
+
+    /// Decodes a JSON string payload into an owned [`OpenHours`], consulting a
+    /// thread-local content memo first. The memo is content-keyed, so it is sound for
+    /// reused buffers; on a hit it returns with a single inner-`Arc` clone.
+    #[inline]
+    fn from_json_payload(value: &str) -> Self {
+        if let Some(inner) = LAST_JSON.with(|c| {
+            let c = c.borrow();
+            match c.as_ref() {
+                Some((s, inner)) if &**s == value => Some(Arc::clone(inner)),
+                _ => None,
+            }
+        }) {
+            return OpenHours { inner };
+        }
+        let oh = Self::parse_owned(value);
+        LAST_JSON.with(|c| {
+            *c.borrow_mut() = Some((Box::from(value), Arc::clone(&oh.inner)));
+        });
+        oh
+    }
+
     /// Returns the raw OSM expression.
     #[inline(always)]
     pub fn raw(&self) -> &str {
@@ -191,7 +289,7 @@ impl OpenHours {
         self.is_open(dt)
     }
 
-    /// Returns the duration until the next opening window via $O(\log N)$ window binary search.
+    /// Returns the duration until the next opening window (one lazy table load).
     #[inline(always)]
     pub fn get_time_to_open<Tz: TimeZone>(&self, from: &DateTime<Tz>) -> Option<Duration> {
         if self.windows.is_empty() {
@@ -202,19 +300,11 @@ impl OpenHours {
         }
 
         let (t, sub_seconds, sub_nanos) = Self::get_week_minute_and_sub(from);
-        let idx = self.find_first_window_starting_at_or_after(t);
-
-        if idx < self.windows.len() {
-            let w = unsafe { self.windows.get_unchecked(idx) };
-            if (w.start as usize) <= t {
-                return Some(Duration::zero());
-            }
-            let diff_min = (w.start as usize) - t;
-            Some(Self::duration_minus_sub(diff_min, sub_seconds, sub_nanos))
-        } else {
-            let diff_min = (MINUTES_PER_WEEK - t) + (unsafe { self.windows.get_unchecked(0).start } as usize);
-            Some(Self::duration_minus_sub(diff_min, sub_seconds, sub_nanos))
+        let e = unsafe { *self.succ_table().get_unchecked(t) };
+        if e & OPEN_FLAG != 0 {
+            return Some(Duration::zero());
         }
+        Some(Self::duration_minus_sub((e & CHANGE_MASK) as usize, sub_seconds, sub_nanos))
     }
 
     /// Returns the duration until an opening window with at least `required` continuous duration is available.
@@ -307,21 +397,15 @@ impl OpenHours {
         }
 
         let (t, sub_seconds, sub_nanos) = Self::get_week_minute_and_sub(dt);
-        let idx = self.find_first_window_starting_at_or_after(t);
-        if idx >= self.windows.len() || (self.windows[idx].start as usize) > t {
+        let e = unsafe { *self.succ_table().get_unchecked(t) };
+        if e & OPEN_FLAG == 0 {
             return None;
         }
-
-        let w = unsafe { self.windows.get_unchecked(idx) };
-        let mut diff_min = (w.end as usize) - t;
-        if idx == self.windows.len() - 1
-            && w.end == MINUTES_PER_WEEK as u16
-            && unsafe { self.windows.get_unchecked(0).start } == 0
-        {
-            diff_min = (MINUTES_PER_WEEK - t) + (unsafe { self.windows.get_unchecked(0).end } as usize);
-        }
-
-        dt.clone().checked_add_signed(Self::duration_minus_sub(diff_min, sub_seconds, sub_nanos))
+        dt.clone().checked_add_signed(Self::duration_minus_sub(
+            (e & CHANGE_MASK) as usize,
+            sub_seconds,
+            sub_nanos,
+        ))
     }
 
     /// Returns (is_currently_open, duration_until_next_state_change).
@@ -335,29 +419,9 @@ impl OpenHours {
         }
 
         let (t, sub_seconds, sub_nanos) = Self::get_week_minute_and_sub(dt);
-        let idx = self.find_first_window_starting_at_or_after(t);
-
-        if idx < self.windows.len() {
-            let w = unsafe { self.windows.get_unchecked(idx) };
-            if (w.start as usize) <= t {
-                // Currently open
-                let mut diff_min = (w.end as usize) - t;
-                if idx == self.windows.len() - 1
-                    && w.end == MINUTES_PER_WEEK as u16
-                    && unsafe { self.windows.get_unchecked(0).start } == 0
-                {
-                    diff_min = (MINUTES_PER_WEEK - t) + (unsafe { self.windows.get_unchecked(0).end } as usize);
-                }
-                return (true, Self::duration_minus_sub(diff_min, sub_seconds, sub_nanos));
-            }
-            // Currently closed, opens at w.start
-            let diff_min = (w.start as usize) - t;
-            return (false, Self::duration_minus_sub(diff_min, sub_seconds, sub_nanos));
-        }
-
-        // Currently closed, opens at windows[0].start next week
-        let diff_min = (MINUTES_PER_WEEK - t) + (unsafe { self.windows.get_unchecked(0).start } as usize);
-        (false, Self::duration_minus_sub(diff_min, sub_seconds, sub_nanos))
+        let e = unsafe { *self.succ_table().get_unchecked(t) };
+        let open = e & OPEN_FLAG != 0;
+        (open, Self::duration_minus_sub((e & CHANGE_MASK) as usize, sub_seconds, sub_nanos))
     }
 
     /// Returns (is_currently_open, next_transition_timestamp).
@@ -371,42 +435,13 @@ impl OpenHours {
         }
 
         let (t, sub_seconds, sub_nanos) = Self::get_week_minute_and_sub(dt);
-        let idx = self.find_first_window_starting_at_or_after(t);
-
-        let n = self.windows.len();
-        if idx < n {
-            let w = unsafe { self.windows.get_unchecked(idx) };
-            if (w.start as usize) <= t {
-                // Currently open
-                let mut diff_min = (w.end as usize) - t;
-                if idx == n - 1
-                    && w.end == MINUTES_PER_WEEK as u16
-                    && unsafe { self.windows.get_unchecked(0).start } == 0
-                {
-                    diff_min = (MINUTES_PER_WEEK - t) + (unsafe { self.windows.get_unchecked(0).end } as usize);
-                }
-                let next_dt = dt
-                    .clone()
-                    .checked_add_signed(Self::duration_minus_sub(diff_min, sub_seconds, sub_nanos))
-                    .unwrap_or_else(|| dt.clone());
-                return (true, next_dt);
-            }
-            // Currently closed, opens at w.start
-            let diff_min = (w.start as usize) - t;
-            let next_dt = dt
-                .clone()
-                .checked_add_signed(Self::duration_minus_sub(diff_min, sub_seconds, sub_nanos))
-                .unwrap_or_else(|| dt.clone());
-            return (false, next_dt);
-        }
-
-        // Currently closed, opens at windows[0].start next week
-        let diff_min = (MINUTES_PER_WEEK - t) + (unsafe { self.windows.get_unchecked(0).start } as usize);
+        let e = unsafe { *self.succ_table().get_unchecked(t) };
+        let open = e & OPEN_FLAG != 0;
         let next_dt = dt
             .clone()
-            .checked_add_signed(Self::duration_minus_sub(diff_min, sub_seconds, sub_nanos))
+            .checked_add_signed(Self::duration_minus_sub((e & CHANGE_MASK) as usize, sub_seconds, sub_nanos))
             .unwrap_or_else(|| dt.clone());
-        (false, next_dt)
+        (open, next_dt)
     }
 
     #[inline(always)]
@@ -435,6 +470,55 @@ impl OpenHours {
         day_idx * 1440 + (hour as usize) * 60 + (minute as usize)
     }
 
+    /// Lazily builds and returns the packed per-minute successor table.
+    ///
+    /// `succ[m] = (open << 15) | minutes_to_next_state_change`, for `m in [0, 10080)`.
+    /// This is a pure function of `windows` and reproduces exactly what the former
+    /// lower-bound search plus the per-window arithmetic returned, including the
+    /// week-boundary wrap for a window that ends at the week end while `windows[0]`
+    /// starts at 0. Built on first query, so parse-only workloads never pay for it.
+    #[inline]
+    fn succ_table(&self) -> &[u16] {
+        self.succ.get_or_init(|| {
+            let week = MINUTES_PER_WEEK;
+            let windows: &[TimeWindow] = &self.windows;
+            let n = windows.len();
+            if n == 0 {
+                return vec![0u16; week].into_boxed_slice();
+            }
+            let last_ends_at_week_end = windows[n - 1].end as usize == week;
+            let first_starts_at_zero = windows[0].start == 0;
+            let mut tbl = vec![0u16; week];
+            let mut idx = 0usize;
+            for (m, slot) in tbl.iter_mut().enumerate() {
+                while idx < n && windows[idx].end as usize <= m {
+                    idx += 1;
+                }
+                if idx < n && windows[idx].start as usize <= m {
+                    // Open minute: distance to the window end (week-wrapped for the last one).
+                    let mut diff = windows[idx].end as usize - m;
+                    if idx == n - 1 && last_ends_at_week_end && first_starts_at_zero {
+                        diff = (week - m) + windows[0].end as usize;
+                    }
+                    *slot = OPEN_FLAG | diff as u16;
+                } else {
+                    // Closed minute: distance to the next window start (week-wrapped).
+                    let diff = if idx < n {
+                        windows[idx].start as usize - m
+                    } else {
+                        (week - m) + windows[0].start as usize
+                    };
+                    *slot = diff as u16;
+                }
+            }
+            tbl.into_boxed_slice()
+        })
+        .as_ref()
+    }
+
+    /// Returns the index of the first window with `end > t` (or `windows.len()`), via an
+    /// unrolled compare chain for small window sets and a branch-light binary search
+    /// otherwise.
     #[inline(always)]
     fn find_first_window_starting_at_or_after(&self, t: usize) -> usize {
         let windows: &[TimeWindow] = &self.windows;
@@ -613,6 +697,7 @@ impl OpenHours {
                 raw: Arc::from(expression),
                 windows: Arc::from(win_list),
                 bitmask: bm,
+                succ: OnceLock::new(),
             }),
         }
     }
@@ -951,8 +1036,16 @@ impl<'de> Deserialize<'de> for OpenHours {
             where
                 E: de::Error,
             {
-                let arc = OpenHours::parse(value);
-                Ok((*arc).clone())
+                Ok(OpenHours::from_json_payload(value))
+            }
+
+            fn visit_borrowed_str<E>(self, value: &'de str) -> Result<OpenHours, E>
+            where
+                E: de::Error,
+            {
+                // serde_json hands a borrowed `&'de str` for an unescaped JSON string;
+                // decode it through the same content-memoed single-clone path.
+                Ok(OpenHours::from_json_payload(value))
             }
         }
 
