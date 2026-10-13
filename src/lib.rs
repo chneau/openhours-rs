@@ -87,7 +87,7 @@ impl OpenHours {
     /// Parses an OSM opening_hours expression with global lock-free caching.
     #[inline(always)]
     pub fn parse(expression: &str) -> Arc<Self> {
-        let trimmed = expression.trim();
+        let trimmed = Self::trim_ascii_str(expression);
         if trimmed.is_empty() {
             return Arc::clone(&EMPTY);
         }
@@ -483,22 +483,16 @@ impl OpenHours {
             }
             _ => {
                 let mut low = 0;
-                let mut high = n - 1;
-                let mut result = n;
-                while low <= high {
+                let mut high = n;
+                while low < high {
                     let mid = (low + high) >> 1;
-                    let w = unsafe { windows.get_unchecked(mid) };
-                    if (w.end as usize) > t {
-                        result = mid;
-                        if mid == 0 {
-                            break;
-                        }
-                        high = mid - 1;
+                    if (unsafe { windows.get_unchecked(mid).end } as usize) > t {
+                        high = mid;
                     } else {
                         low = mid + 1;
                     }
                 }
-                result
+                low
             }
         }
     }
@@ -697,6 +691,20 @@ impl OpenHours {
         } else {
             Duration::new(secs - 1, (1_000_000_000 - sub_nanos) as u32).unwrap()
         }
+    }
+
+    /// ASCII-only trim for the parse hot path: `str::trim` uses Unicode
+    /// whitespace tables and char-boundary handling, but OSM expressions are
+    /// ASCII. Falls back to `str::trim` for any non-ASCII edge byte.
+    #[inline(always)]
+    fn trim_ascii_str(s: &str) -> &str {
+        let b = s.as_bytes();
+        let lo = b.first().copied().unwrap_or(0);
+        let hi = b.last().copied().unwrap_or(0);
+        if lo >= 0x80 || hi >= 0x80 {
+            return s.trim();
+        }
+        s.trim_ascii()
     }
 
     #[inline(always)]
